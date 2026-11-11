@@ -1,0 +1,34 @@
+{
+	"FileVersion": 3,
+	"Version": 0,
+	"VersionName": "0.1.0",
+	"SemVersion": "0.1.0",
+	"GameVersion": ">=517554",
+	"FriendlyName": "Dimensional Dismantle Crate",
+	"Description": "Dismantle crates upload their contents to the Dimensional Depot by themselves, at the same speed as an uploader, whenever the depot has room. Needs the Dimensional Depot research and at least one uploader built. Only the host or server needs this mod.",
+	"Category": "Modding",
+	"CreatedBy": "Zambie223",
+	"CreatedByURL": "https://github.com/Zambie223",
+	"DocsURL": "https://github.com/Zambie223/DimensionalDismantleCrate#readme",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/Zambie223/DimensionalDismantleCrate/issues",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"RequiredOnRemote": false,
+	"Modules": [
+		{
+			"Name": "DimensionalDismantleCrate",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "SML",
+			"Enabled": true,
+			"SemVersion": "^3.12.0"
+		}
+	]
+}
