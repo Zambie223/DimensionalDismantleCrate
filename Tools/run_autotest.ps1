@@ -69,7 +69,11 @@ while ((Get-Date) -lt $deadline) {
 }
 "result: $result"
 
-# 3. Close the game by force (graceful close doesn't work from the shell) right away, before any autosave.
+# 3. Delete the test session's new autosaves WHILE the game still runs: Steam Auto-Cloud syncs the save folder when the
+#    game exits, and a save deleted after that stays in the cloud and is downloaded again later.
+Get-ChildItem $Saves -File -Filter "$TestSession*" | Where-Object { $_.Name -notin $before.Name } |
+    ForEach-Object { Remove-Item $_.FullName -Force; "deleted test autosave $($_.Name) (game still running)" }
+# Then close the game by force (graceful close doesn't work from the shell).
 Get-Process FactoryGameSteam*, CrashReportClient* -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 3
 
@@ -89,4 +93,10 @@ foreach ($f in $new) {
 }
 $changed = $after | Where-Object { $b = $before | Where-Object Name -eq $_.Name; $b -and ($b.LastWriteTime -ne $_.LastWriteTime -or $b.Length -ne $_.Length) }
 foreach ($f in $changed) { "CHANGED existing save: $($f.Name)" }
+# Steam Cloud must not list test autosaves (they would come back). Steam updates this file shortly after the game exits.
+Start-Sleep -Seconds 30
+foreach ($vdf in Get-ChildItem "${env:ProgramFiles(x86)}\Steam\userdata\*\526870\remotecache.vdf" -ErrorAction SilentlyContinue) {
+    $listed = Select-String -Path $vdf.FullName -Pattern ([regex]::Escape($TestSession) + '[^"]*_autosave_') | ForEach-Object { $_.Line.Trim() }
+    if ($listed) { "STEAM CLOUD still lists test autosaves (delete them in Steam's cloud storage page): $listed" } else { 'steam cloud: no test autosaves listed' }
+}
 "log copy: $Backup\FactoryGame.log"

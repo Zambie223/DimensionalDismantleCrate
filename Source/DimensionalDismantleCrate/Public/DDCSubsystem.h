@@ -4,6 +4,7 @@
 #include "DDCConstants.h"
 #include "DDCUploadTimer.h"
 #include "Subsystem/ModSubsystem.h"
+#include "UObject/ObjectKey.h"
 #include "DDCSubsystem.generated.h"
 
 class AFGCentralStorageSubsystem;
@@ -39,15 +40,14 @@ public:
 	/** Sets one config value on this machine and saves it; the change handler applies it. Refused on clients. */
 	static bool SetConfigValue(const UWorld* World, const FString& Key, const FString& ValueText, FString& OutMessage);
 
-	/** True if uploading is allowed right now (Dimensional Depot research done and at least one uploader built). */
-	bool IsUploadingAllowed() { return IsGateOpen(); }
-
 	/** Writes the configuration, gate, upload speed and crate statistics to the output device and the log. */
 	void DescribeStatus(FOutputDevice& Ar) const;
 
 	virtual void Tick(float DeltaSeconds) override;
 
 #if DDC_DEV_COMMANDS
+	/** DEV: true if uploading is allowed right now (Dimensional Depot research done and at least one uploader built). */
+	bool IsUploadingAllowed() { return IsGateOpen(); }
 	/** DEV: average and worst game-thread cost of this subsystem's Tick since the last reset, in microseconds. */
 	void ResetTickStats() { TickSecondsTotal = 0.0; TickSecondsMax = 0.0; TickCount = 0; }
 	double GetAverageTickMicroseconds() const { return TickCount > 0 ? TickSecondsTotal * 1.0e6 / TickCount : 0.0; }
@@ -65,6 +65,8 @@ private:
 	struct FTrackedCrate
 	{
 		TWeakObjectPtr<AFGCrate> Crate;
+		/** Identity for TrackedKeys; stays usable after the crate is gone, so the entry can be removed from the set. */
+		TObjectKey<AFGCrate> Key;
 		/** Per crate mode. */
 		DDC::FUploadTimer Timer;
 		/** Per stack slot mode, one per inventory slot. */
@@ -106,6 +108,8 @@ private:
 	void NoteUpload();
 
 	TArray<FTrackedCrate> Crates;
+	/** The crates in Crates, for constant-time duplicate checks when crates are found again by spawn events or rescans. */
+	TSet<TObjectKey<AFGCrate>> TrackedKeys;
 
 	/** Crates seen while the upload loop runs; added to Crates after it. */
 	TArray<TWeakObjectPtr<AFGCrate>> PendingCrates;

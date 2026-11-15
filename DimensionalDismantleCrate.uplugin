@@ -1,8 +1,8 @@
 {
 	"FileVersion": 3,
-	"Version": 0,
-	"VersionName": "0.1.0",
-	"SemVersion": "0.1.0",
+	"Version": 1,
+	"VersionName": "0.1.1",
+	"SemVersion": "0.1.1",
 	"GameVersion": ">=517554",
 	"FriendlyName": "Dimensional Dismantle Crate",
 	"Description": "Dismantle crates upload their contents to the Dimensional Depot by themselves, at the same speed as an uploader, whenever the depot has room. Needs the Dimensional Depot research and at least one uploader built. Only the host or server needs this mod.",

@@ -216,6 +216,8 @@ void ADimensionalDismantleCrateSubsystem::EndPlay(const EEndPlayReason::Type End
 	}
 	BoundConfigSection.Reset();
 	Crates.Reset();
+	TrackedKeys.Reset();
+	PendingCrates.Reset();
 	Super::EndPlay(EndPlayReason);
 }
 
@@ -234,15 +236,15 @@ void ADimensionalDismantleCrateSubsystem::TrackCrate(AFGCrate* Crate)
 		PendingCrates.AddUnique(Crate);
 		return;
 	}
-	for (const FTrackedCrate& Entry : Crates)
+	bool bAlreadyTracked = false;
+	TrackedKeys.Add(TObjectKey<AFGCrate>(Crate), &bAlreadyTracked);
+	if (bAlreadyTracked)
 	{
-		if (Entry.Crate.Get() == Crate)
-		{
-			return;
-		}
+		return;
 	}
 	FTrackedCrate& Entry = Crates.AddDefaulted_GetRef();
 	Entry.Crate = Crate;
+	Entry.Key = TObjectKey<AFGCrate>(Crate);
 }
 
 void ADimensionalDismantleCrateSubsystem::OnActorSpawned(AActor* Actor)
@@ -270,10 +272,15 @@ void ADimensionalDismantleCrateSubsystem::Rescan()
 void ADimensionalDismantleCrateSubsystem::PruneInvalidCrates()
 {
 	const int32 Before = Crates.Num();
-	Crates.RemoveAll([](const FTrackedCrate& Entry)
+	Crates.RemoveAll([this](const FTrackedCrate& Entry)
 	{
 		const AFGCrate* Crate = Entry.Crate.Get();
-		return !IsValid(Crate) || Crate->IsActorBeingDestroyed();
+		if (IsValid(Crate) && !Crate->IsActorBeingDestroyed())
+		{
+			return false;
+		}
+		TrackedKeys.Remove(Entry.Key);
+		return true;
 	});
 	if (Crates.Num() != Before && SharedCursor >= Crates.Num())
 	{

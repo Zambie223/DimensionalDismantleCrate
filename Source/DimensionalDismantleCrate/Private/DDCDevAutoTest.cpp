@@ -63,7 +63,9 @@ namespace
 		TMap<const AFGCrate*, int32> Snapshot;
 		int32 DepotSnapshot = 0;
 		int32 SlotsAtSnapshot = 0;
-		TWeakObjectPtr<AFGCrate> CrateA, CrateB, CrateMulti, CrateFullFirst, CrateDeath, CrateSmall;
+		TWeakObjectPtr<AFGCrate> CrateA, CrateB, CrateMulti, CrateFullFirst, CrateIdle, CrateDeath, CrateSmall;
+		/** Items taken out of the depot by the idle-resume check. */
+		int32 FreedRoom = 0;
 
 		static void Log(const FString& Line) { UE_LOG(LogDimensionalDismantleCrate, Display, TEXT("[DDCTest] %s"), *Line); }
 
@@ -372,6 +374,49 @@ namespace
 				return 0.1f;
 			});
 
+			// 4b. An idle crate (nothing the depot can take) starts again once the depot has room. Idle crates only
+			//     re-check every FUploadTimer::IdleRecheckSeconds, so this covers that path. The other test crate holding
+			//     the full item is removed first so it can't take the room.
+			Steps.Add([this]
+			{
+				if (!ItemFull)
+				{
+					Skip(TEXT("idle crate resumes"), TEXT("no item in this depot is at its limit"));
+					return 0.1f;
+				}
+				if (AFGCrate* Live = CrateFullFirst.Get())
+				{
+					Live->Destroy();
+				}
+				Track(SpawnCrate(World.Get(), {{ItemFull, 5}}, EFGCrateType::CT_DismantleCrate, FVector(600, 600, 100)), CrateIdle);
+				return 1.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!ItemFull)
+				{
+					return 0.1f;
+				}
+				Check(CountItems(CrateIdle.Get(), ItemFull) == 5, TEXT("idle crate waits while the depot is full"),
+					FString::Printf(TEXT("%d of 5 left"), CountItems(CrateIdle.Get(), ItemFull)));
+				FreedRoom = Depot()->TryRemoveItemsFromCentralStorage(ItemFull, 3);
+				return 3.0f * T + DDC::FUploadTimer::IdleRecheckSeconds + 1.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!ItemFull)
+				{
+					return 0.1f;
+				}
+				const AFGCentralStorageSubsystem* CS = Depot();
+				const int32 Left = CountItems(CrateIdle.Get(), ItemFull);
+				const bool bRefilled = CS->GetNumItemsFromCentralStorage(ItemFull) >= CS->GetCentralStorageItemLimit(ItemFull);
+				// The save's own crates may hold the same item and share the freed room, so the test crate only has to take part.
+				Check(FreedRoom > 0 && bRefilled && Left < 5, TEXT("idle crate resumes"),
+					FString::Printf(TEXT("freed %d, depot %s, test crate %d of 5 left"), FreedRoom, bRefilled ? TEXT("full again") : TEXT("NOT full"), Left));
+				return 0.1f;
+			});
+
 			// 5. Death crates: ignored by default; with the option, items upload but equipment stays.
 			Steps.Add([this]
 			{
@@ -443,7 +488,7 @@ namespace
 			});
 
 			// 8. Performance: 200 crates that can't upload (depot full for their item) are the worst steady case, since
-			//    every idle crate re-checks its slots each tick, like an idle vanilla uploader. Budget: 1 ms average per tick.
+			//    every idle crate re-checks its slots (at most every FUploadTimer::IdleRecheckSeconds). Budget: 1 ms average per tick.
 			Steps.Add([this]
 			{
 				if (!ItemFull)

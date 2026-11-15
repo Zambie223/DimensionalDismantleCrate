@@ -10,9 +10,11 @@ Dismantle crates upload their contents to the **Dimensional Depot** by themselve
 
 ## Installation
 
-You need Satisfactory 1.2 (build 517554 or newer) with Satisfactory Mod Loader (SML) 3.12 or newer installed.
+You need Satisfactory 1.2 (build 517554 or newer).
 
-**By hand**, from this repository's releases:
+**With Satisfactory Mod Manager (recommended):** search for *Dimensional Dismantle Crate* in [Satisfactory Mod Manager](https://docs.ficsit.app/satisfactory-modding/latest/ForUsers/SatisfactoryModManager.html), or open its page on the [Satisfactory Mod Repository](https://ficsit.app/mod/DimensionalDismantleCrate) and choose Install. The mod manager also installs Satisfactory Mod Loader (SML) and keeps the mod up to date.
+
+**By hand**, from this repository's releases (you also need Satisfactory Mod Loader (SML) 3.12 or newer installed):
 
 1. From the Releases page, download the zip for where it will run:
    - `DimensionalDismantleCrate-Windows.zip` for your game
@@ -50,7 +52,7 @@ Dedicated servers have no menu. Use either of these:
       "RateMode": 0,
       "IncludeDeathCrates": false,
       "UploadDeathCrateEquipment": false,
-      "SML_ModVersion_DoNotChange": "0.1.0"
+      "SML_ModVersion_DoNotChange": "0.1.1"
   }
   ```
   Then restart the server.
@@ -64,16 +66,18 @@ Dedicated servers have no menu. Use either of these:
 ## Limits and notes
 
 - **Speed:** like an uploader, a crate uploads at most one item per game tick, and catches up after a hitch the same way. Very high upload speeds from other mods therefore top out at your frame rate (or the server's tick rate) per crate, or per filled slot in Per stack slot mode.
-- **Many crates:** 200 crates that can't upload anything cost about 0.2 ms per frame in testing.
+- **Waiting crates:** a crate with nothing the depot can take checks again every 0.25 seconds, so it starts uploading up to 0.25 seconds after the depot has room.
+- **Many crates:** 200 crates that can't upload anything cost about 0.1 ms per frame in testing.
 - **Saves:** nothing is written into your save. An upload interval that was in progress when you saved restarts after loading, so at most one item's worth of time is lost. Removing the mod leaves crates as they are.
 - **Other crates:** crates created by other mods without a dismantle or death crate type are left alone.
 
 ## Status
 
-Version 0.1.0 has been tested on Windows in single player and on Windows and Linux dedicated servers with a joined player (with and without the mod), using a late-game save with 16 uploaders and an automated in-game test of 17 checks:
+Version 0.1.1 has been tested on Windows in single player and on Windows and Linux dedicated servers with a joined player (with and without the mod), using a late-game save with 16 uploaders. An automated in-game test of 19 checks passed in every one of these setups, and the Mod Options menu was checked in the release build. The checks cover:
 - upload speed in all three modes, matching a vanilla uploader (240 items/min at full research)
 - depot counts matching what left the crates, and items the depot is full of staying in the crate while the rest upload
 - death crates ignored by default, uploaded with the option, and equipment kept back unless that option is on
+- crates that wait while the depot is full and start again once it has room
 - empty crates disappearing, turning the mod off, and 200 idle crates
 - the Mod Options menu, the config file and resetting to defaults
 
