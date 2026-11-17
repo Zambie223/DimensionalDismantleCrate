@@ -69,6 +69,19 @@ PROPERTIES = [
         ),
         "default": False,
     },
+    {
+        "key": "SendDismantleOverflowToDepot",
+        "type": "bool",
+        "display_name": "Send dismantle overflow straight to the depot",
+        "tooltip": (
+            "When you dismantle something and your inventory is full, the items that don't fit go straight into the\n"
+            "Dimensional Depot instead of a dismantle crate, without the upload wait, as long as the depot has room.\n"
+            "Items the depot can't take still go into a crate. In multiplayer, very large amounts arrive over a few seconds.\n"
+            "Needs the Dimensional Depot research and at least one uploader built. Works whether or not crates upload.\n"
+            + HOST_NOTE
+        ),
+        "default": False,
+    },
 ]
 
 

@@ -72,7 +72,7 @@ for i in $(seq 1 120); do
   if server_log | grep -aq '\[DDCTest\] DONE'; then break; fi
   sleep 5
 done
-server_log | grep -a '\[DDCTest\]\|Gate:\|Uploaded since' | sed 's/^\[[^]]*\]\[[^]]*\]//' | tail -60
+server_log | grep -a '\[DDCTest\]\|Gate:\|Uploaded since' | sed 's/^\[[^]]*\]\[[^]]*\]//' | tail -100
 cmd "DDC.Dev.Crates"
 cmd "DDC.Status"
 

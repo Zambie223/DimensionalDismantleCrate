@@ -6,15 +6,25 @@
 #if DDC_DEV_COMMANDS
 
 #include "CoreMinimal.h"
+#include "Buildables/FGBuildable.h"
+#include "Buildables/FGBuildableConveyorBelt.h"
 #include "DDCConstants.h"
 #include "DDCDevTools.h"
 #include "DDCLog.h"
+#include "DDCRefundHook.h"
 #include "DDCSubsystem.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "Equipment/FGBuildGun.h"
+#include "Equipment/FGBuildGunDismantle.h"
 #include "FGCentralStorageSubsystem.h"
+#include "FGCharacterPlayer.h"
+#include "FGDismantleInterface.h"
 #include "FGInventoryComponent.h"
 #include "FGCrate.h"
+#include "FGLightweightBuildableSubsystem.h"
+#include "FGRecipe.h"
+#include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
 #include "ItemAmount.h"
 #include "Containers/Ticker.h"
@@ -27,9 +37,83 @@
 #include "TimerManager.h"
 #include "UObject/UObjectIterator.h"
 
+/**
+ * DEV: runs the game's real server-side dismantle (the same code a player's build gun runs), so the test covers how
+ * the game hands out refunds. Named as a friend of UFGBuildGunStateDismantle in Config/AccessTransformers.ini, which
+ * exists only for dev builds. Global namespace on purpose: that is where the friend declaration points.
+ */
+class FDDCDevDismantleAccess
+{
+public:
+	static void Dismantle(UFGBuildGunStateDismantle* State, const TArray<AActor*>& Actors, const TArray<FDismantleLightweightBundle>& Bundles)
+	{
+		State->Server_DismantleActors_Implementation(Actors, Bundles);
+	}
+};
+
 namespace
 {
 	using namespace DDC::Dev;
+
+	using FItemCounts = TMap<UClass*, int32>;
+
+	void AddCounts(FItemCounts& Out, const UFGInventoryComponent* Inventory)
+	{
+		if (!Inventory)
+		{
+			return;
+		}
+		for (int32 Slot = 0; Slot < Inventory->GetSizeLinear(); ++Slot)
+		{
+			FInventoryStack Stack;
+			if (Inventory->GetStackFromIndex(Slot, Stack) && Stack.HasItems())
+			{
+				Out.FindOrAdd(Stack.Item.GetItemClass()) += Stack.NumItems;
+			}
+		}
+	}
+
+	int32 Sum(const FItemCounts& Counts)
+	{
+		int32 Total = 0;
+		for (const TPair<UClass*, int32>& Pair : Counts)
+		{
+			Total += Pair.Value;
+		}
+		return Total;
+	}
+
+	/** After - Before per item class, keeping only changes. */
+	FItemCounts Diff(const FItemCounts& After, const FItemCounts& Before)
+	{
+		FItemCounts Out;
+		for (const TPair<UClass*, int32>& Pair : After)
+		{
+			const int32 Change = Pair.Value - Before.FindRef(Pair.Key);
+			if (Change != 0)
+			{
+				Out.Add(Pair.Key, Change);
+			}
+		}
+		for (const TPair<UClass*, int32>& Pair : Before)
+		{
+			if (!After.Contains(Pair.Key))
+			{
+				Out.Add(Pair.Key, -Pair.Value);
+			}
+		}
+		return Out;
+	}
+
+	FString Describe(const FItemCounts& Counts)
+	{
+		FString Text;
+		for (const TPair<UClass*, int32>& Pair : Counts)
+		{
+			Text += FString::Printf(TEXT("%s%s=%d"), Text.IsEmpty() ? TEXT("") : TEXT(" "), Pair.Key ? *Pair.Key->GetName() : TEXT("?"), Pair.Value);
+		}
+		return Text.IsEmpty() ? FString(TEXT("nothing")) : Text;
+	}
 
 	class FAutoTest : public TSharedFromThis<FAutoTest>
 	{
@@ -66,6 +150,215 @@ namespace
 		TWeakObjectPtr<AFGCrate> CrateA, CrateB, CrateMulti, CrateFullFirst, CrateIdle, CrateDeath, CrateSmall;
 		/** Items taken out of the depot by the idle-resume check. */
 		int32 FreedRoom = 0;
+
+		// Dismantle overflow steps
+		TWeakObjectPtr<AFGCharacterPlayer> Player;
+		TWeakObjectPtr<UFGBuildGunStateDismantle> DismantleState;
+		TArray<FInventoryStack> InventoryBackup;
+		TSubclassOf<UFGItemDescriptor> Filler;
+		TSubclassOf<AFGBuildable> LightweightClass;
+		TSubclassOf<UFGRecipe> LightweightRecipe;
+		/** Refund of one batch of lightweight buildables, measured with the option off. */
+		FItemCounts BatchRefund;
+		/** Measurement baseline. */
+		FItemCounts CrateItemsBefore, InventoryBefore;
+		int64 SentBefore = 0;
+		int32 CallsWithActorBefore = 0, CallsWithoutActorBefore = 0, CrateCountBefore = 0;
+		/** What the depot should take of the next refund, computed before dismantling. */
+		int32 ExpectedSent = 0;
+		int32 ExpectedTotal = 0;
+		bool bOverflowReady = false;
+		static constexpr int32 BatchSize = 10;
+
+		ADimensionalDismantleCrateSubsystem* ModSubsystem() const { return ADimensionalDismantleCrateSubsystem::Get(World.Get()); }
+
+		FItemCounts CrateItems() const
+		{
+			FItemCounts Counts;
+			for (TActorIterator<AFGCrate> It(World.Get()); It; ++It)
+			{
+				if (IsValid(*It) && !It->IsActorBeingDestroyed())
+				{
+					AddCounts(Counts, It->GetInventory());
+				}
+			}
+			return Counts;
+		}
+
+		int32 CrateCount() const
+		{
+			int32 Count = 0;
+			for (TActorIterator<AFGCrate> It(World.Get()); It; ++It)
+			{
+				Count += IsValid(*It) && !It->IsActorBeingDestroyed() ? 1 : 0;
+			}
+			return Count;
+		}
+
+		FItemCounts InventoryItems() const
+		{
+			FItemCounts Counts;
+			AddCounts(Counts, Player.IsValid() ? Player->GetInventory() : nullptr);
+			return Counts;
+		}
+
+		/** Fills every inventory slot with a full stack of the filler (all but one slot with bLeaveOneFree). */
+		void FillInventory(const bool bLeaveOneFree)
+		{
+			UFGInventoryComponent* Inventory = Player.IsValid() ? Player->GetInventory() : nullptr;
+			if (!Inventory || !Filler)
+			{
+				return;
+			}
+			Inventory->Empty();
+			const int32 StackSize = FMath::Max(1, UFGItemDescriptor::GetStackSize(Filler));
+			for (int32 Slot = bLeaveOneFree ? 1 : 0; Slot < Inventory->GetSizeLinear(); ++Slot)
+			{
+				Inventory->AddStackToIndex(Slot, FInventoryStack(StackSize, Filler), true);
+			}
+		}
+
+		/** Depot share of a refund at the depot's current fill: everything it accepts, up to its limit. */
+		int32 DepotShare(const FItemCounts& Refund) const
+		{
+			const AFGCentralStorageSubsystem* CS = Depot();
+			int32 Share = 0;
+			for (const TPair<UClass*, int32>& Pair : Refund)
+			{
+				const TSubclassOf<UFGItemDescriptor> Item = Pair.Key;
+				if (Item && CS->CanUploadInventoryItemToCentralStorage(FInventoryItem(Item)))
+				{
+					const int32 Room = CS->GetCentralStorageItemLimit(Item) - CS->GetNumItemsFromCentralStorage(Item);
+					Share += FMath::Clamp(Room, 0, Pair.Value);
+				}
+			}
+			return Share;
+		}
+
+		/**
+		 * Takes items out of the depot until it has room for the refund plus Extra of every refund item, so the
+		 * overflow path is exercised even in a save whose depot is full of those items. Call it right before the
+		 * dismantle (same frame), so the save's own uploaders can't fill the room first.
+		 */
+		void MakeRoom(const FItemCounts& Refund, const int32 Extra)
+		{
+			AFGCentralStorageSubsystem* CS = Depot();
+			for (const TPair<UClass*, int32>& Pair : Refund)
+			{
+				const TSubclassOf<UFGItemDescriptor> Item = Pair.Key;
+				const int32 Stored = CS->GetNumItemsFromCentralStorage(Item);
+				const int32 Need = Pair.Value + Extra - (CS->GetCentralStorageItemLimit(Item) - Stored);
+				if (Need > 0)
+				{
+					const int32 Freed = CS->TryRemoveItemsFromCentralStorage(Item, FMath::Min(Need, Stored));
+					Log(FString::Printf(TEXT("made room: took %d %s out of the depot"), Freed, *Item->GetName()));
+				}
+			}
+		}
+
+		/** The item class with the largest share of a refund. */
+		static UClass* MainItem(const FItemCounts& Refund)
+		{
+			UClass* Main = nullptr;
+			int32 Most = 0;
+			for (const TPair<UClass*, int32>& Pair : Refund)
+			{
+				if (Pair.Value > Most)
+				{
+					Most = Pair.Value;
+					Main = Pair.Key;
+				}
+			}
+			return Main;
+		}
+
+		void BeginMeasure()
+		{
+			CrateItemsBefore = CrateItems();
+			InventoryBefore = InventoryItems();
+			SentBefore = ModSubsystem() ? ModSubsystem()->GetItemsSentDirectly() : 0;
+			CallsWithActorBefore = DDC::RefundHook::GetCallsWithActor();
+			CallsWithoutActorBefore = DDC::RefundHook::GetCallsWithoutActor();
+			CrateCountBefore = CrateCount();
+		}
+
+		int32 SentSinceMeasure() const { return ModSubsystem() ? static_cast<int32>(ModSubsystem()->GetItemsSentDirectly() - SentBefore) : 0; }
+
+		/** Up to BatchSize valid lightweight instances of the chosen class and recipe, nearest to the player first. */
+		TArray<int32> PickLightweight() const
+		{
+			TArray<int32> Picked;
+			const AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(World.Get());
+			const TArray<FRuntimeBuildableInstanceData>* Instances = Lightweights && LightweightClass
+				? Lightweights->GetAllLightweightBuildableInstances().Find(LightweightClass) : nullptr;
+			if (!Instances || !Player.IsValid())
+			{
+				return Picked;
+			}
+			const FVector From = Player->GetActorLocation();
+			TArray<TPair<double, int32>> Candidates;
+			for (int32 Index = 0; Index < Instances->Num(); ++Index)
+			{
+				const FRuntimeBuildableInstanceData& Data = (*Instances)[Index];
+				if (Data.IsValid() && !Data.BlueprintProxy && Data.BuiltWithRecipe == LightweightRecipe)
+				{
+					Candidates.Emplace(FVector::DistSquared(From, Data.Transform.GetLocation()), Index);
+				}
+			}
+			Candidates.Sort([](const TPair<double, int32>& A, const TPair<double, int32>& B) { return A.Key < B.Key; });
+			for (int32 Index = 0; Index < Candidates.Num() && Picked.Num() < BatchSize; ++Index)
+			{
+				Picked.Add(Candidates[Index].Value);
+			}
+			return Picked;
+		}
+
+		/** Dismantles one batch of lightweight buildables through the game's own server dismantle. */
+		bool DismantleLightweightBatch()
+		{
+			const TArray<int32> Indices = PickLightweight();
+			if (Indices.Num() < BatchSize || !DismantleState.IsValid())
+			{
+				return false;
+			}
+			FDismantleLightweightBundle Bundle(LightweightClass);
+			Bundle.RemovalIndices = Indices;
+			FDDCDevDismantleAccess::Dismantle(DismantleState.Get(), {}, {Bundle});
+			return true;
+		}
+
+		/** Picks the lightweight class with the most dismantlable instances of one recipe, preferring foundations. */
+		void ChooseLightweightClass()
+		{
+			const AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(World.Get());
+			if (!Lightweights)
+			{
+				return;
+			}
+			int32 BestScore = 0;
+			for (const TPair<TSubclassOf<AFGBuildable>, TArray<FRuntimeBuildableInstanceData>>& Pair : Lightweights->GetAllLightweightBuildableInstances())
+			{
+				TMap<UClass*, int32> PerRecipe;
+				for (const FRuntimeBuildableInstanceData& Data : Pair.Value)
+				{
+					if (Data.IsValid() && !Data.BlueprintProxy)
+					{
+						PerRecipe.FindOrAdd(Data.BuiltWithRecipe.Get())++;
+					}
+				}
+				for (const TPair<UClass*, int32>& Recipe : PerRecipe)
+				{
+					// Five batches are used; foundations count double so a common, simple refund wins.
+					const int32 Score = Recipe.Value < 5 * BatchSize ? 0 : Recipe.Value * (Pair.Key->GetName().Contains(TEXT("Foundation")) ? 2 : 1);
+					if (Score > BestScore)
+					{
+						BestScore = Score;
+						LightweightClass = Pair.Key;
+						LightweightRecipe = Recipe.Key;
+					}
+				}
+			}
+		}
 
 		static void Log(const FString& Line) { UE_LOG(LogDimensionalDismantleCrate, Display, TEXT("[DDCTest] %s"), *Line); }
 
@@ -483,6 +776,279 @@ namespace
 			Steps.Add([this]
 			{
 				Check(TotalUploadedSince() == 0, TEXT("disabled uploads nothing"), FString::Printf(TEXT("%d uploaded"), TotalUploadedSince()));
+				Set(DDC::KeyEnabled, TEXT("true"));
+				return 0.5f;
+			});
+
+			// 9. Dismantle overflow straight to the depot. Real dismantles through the game's server code, with the
+			//    player's inventory filled so the refund overflows. Crate uploading is off meanwhile, so crates only change
+			//    through dismantling and the overflow option. Lightweight buildables (foundations and the like) and
+			//    building actors reach the game through different refund helpers; both are covered.
+			Steps.Add([this]
+			{
+				APlayerController* Controller = World->GetFirstPlayerController();
+				Player = Controller ? Cast<AFGCharacterPlayer>(Controller->GetPawn()) : nullptr;
+				AFGBuildGun* BuildGun = Player.IsValid() ? Player->GetBuildGun() : nullptr;
+				DismantleState = BuildGun ? Cast<UFGBuildGunStateDismantle>(BuildGun->GetBuildGunStateFor(EBuildGunState::BGS_DISMANTLE)) : nullptr;
+				Filler = FindItemClass(TEXT("Leaves"));
+				ChooseLightweightClass();
+				Log(FString::Printf(TEXT("overflow setup: player %s, dismantle state %s, filler %s, lightweight %s (recipe %s)"),
+					Player.IsValid() ? *Player->GetName() : TEXT("none"), DismantleState.IsValid() ? TEXT("ok") : TEXT("none"),
+					Filler ? *Filler->GetName() : TEXT("none"), LightweightClass ? *LightweightClass->GetName() : TEXT("none"),
+					LightweightRecipe ? *LightweightRecipe->GetName() : TEXT("none")));
+				bOverflowReady = Player.IsValid() && DismantleState.IsValid() && Filler && LightweightClass;
+				if (!bOverflowReady)
+				{
+					Skip(TEXT("dismantle overflow"), TEXT("no player, build gun, filler item or lightweight buildables to dismantle"));
+					return 0.1f;
+				}
+				Player->GetInventory()->GetInventoryStacks(InventoryBackup);
+				Set(DDC::KeyEnabled, TEXT("false"));
+				Set(DDC::KeyOverflowToDepot, TEXT("false"));
+				FillInventory(false);
+				return 1.0f;
+			});
+
+			// 9a. Option off: the game hands the overflow to the hooked helper, which leaves it alone (a crate as usual).
+			Steps.Add([this]
+			{
+				if (!bOverflowReady)
+				{
+					return 0.1f;
+				}
+				BeginMeasure();
+				if (!DismantleLightweightBatch())
+				{
+					Check(false, TEXT("option off: overflow goes into a crate"), TEXT("could not pick a batch to dismantle"));
+					bOverflowReady = false;
+				}
+				return 1.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!bOverflowReady)
+				{
+					return 0.1f;
+				}
+				const int32 Calls = DDC::RefundHook::GetCallsWithoutActor() - CallsWithoutActorBefore;
+				Check(Calls > 0, TEXT("game passes lightweight overflow to the hook"), FString::Printf(TEXT("%d call(s)"), Calls));
+				BatchRefund = Diff(CrateItems(), CrateItemsBefore);
+				const FItemCounts Inventory = Diff(InventoryItems(), InventoryBefore);
+				Check(Sum(BatchRefund) > 0 && Sum(Inventory) == 0 && SentSinceMeasure() == 0, TEXT("option off: overflow goes into a crate"),
+					FString::Printf(TEXT("crates +%s, inventory +%d, sent %d"), *Describe(BatchRefund), Sum(Inventory), SentSinceMeasure()));
+				bOverflowReady = Sum(BatchRefund) > 0;
+				Set(DDC::KeyOverflowToDepot, TEXT("true"));
+				return 1.0f;
+			});
+
+			// 9b. Option on: the overflow goes to the depot; only what the depot can't take goes into a crate.
+			Steps.Add([this]
+			{
+				if (!bOverflowReady)
+				{
+					return 0.1f;
+				}
+				MakeRoom(BatchRefund, 200);
+				ExpectedSent = DepotShare(BatchRefund);
+				ExpectedTotal = Sum(BatchRefund);
+				BeginMeasure();
+				DismantleLightweightBatch();
+				return 1.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!bOverflowReady)
+				{
+					return 0.1f;
+				}
+				const int32 Sent = SentSinceMeasure();
+				const int32 Crated = Sum(Diff(CrateItems(), CrateItemsBefore));
+				Check(Sent > 0 && Sent == ExpectedSent && Sent + Crated == ExpectedTotal, TEXT("overflow straight to the depot"),
+					FString::Printf(TEXT("sent %d (expected %d), crates +%d, refund %d"), Sent, ExpectedSent, Crated, ExpectedTotal));
+				Check(ExpectedSent == ExpectedTotal && CrateCount() == CrateCountBefore, TEXT("no crate when the depot takes everything"),
+					FString::Printf(TEXT("depot share %d of %d, %d crate(s) before, %d after"), ExpectedSent, ExpectedTotal, CrateCountBefore, CrateCount()));
+				return 0.1f;
+			});
+
+			// 9c. Building actors (conveyor belts) go through the other refund helper.
+			Steps.Add([this]
+			{
+				if (!bOverflowReady)
+				{
+					return 0.1f;
+				}
+				TArray<AActor*> Targets;
+				FItemCounts Peek;
+				const FVector From = Player->GetActorLocation();
+				TArray<AFGBuildableConveyorBelt*> Belts;
+				for (TActorIterator<AFGBuildableConveyorBelt> It(World.Get()); It; ++It)
+				{
+					if (IsValid(*It) && !It->IsActorBeingDestroyed() && IFGDismantleInterface::Execute_CanDismantle(*It))
+					{
+						Belts.Add(*It);
+					}
+				}
+				Belts.Sort([&From](const AFGBuildableConveyorBelt& A, const AFGBuildableConveyorBelt& B)
+				{
+					return FVector::DistSquared(From, A.GetActorLocation()) < FVector::DistSquared(From, B.GetActorLocation());
+				});
+				for (int32 Index = 0; Index < Belts.Num() && Targets.Num() < 2; ++Index)
+				{
+					TArray<FInventoryStack> Refund;
+					IFGDismantleInterface::Execute_GetDismantleRefund(Belts[Index], Refund, false);
+					for (const FInventoryStack& Stack : Refund)
+					{
+						Peek.FindOrAdd(Stack.Item.GetItemClass()) += Stack.NumItems;
+					}
+					Targets.Add(Belts[Index]);
+				}
+				if (Targets.Num() == 0)
+				{
+					Skip(TEXT("building overflow straight to the depot"), TEXT("no conveyor belt to dismantle"));
+					ExpectedTotal = -1;
+					return 0.1f;
+				}
+				ExpectedSent = DepotShare(Peek);
+				ExpectedTotal = Sum(Peek);
+				Log(FString::Printf(TEXT("dismantling %d belt(s), refund %s"), Targets.Num(), *Describe(Peek)));
+				BeginMeasure();
+				FDDCDevDismantleAccess::Dismantle(DismantleState.Get(), Targets, {});
+				return 1.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!bOverflowReady || ExpectedTotal < 0)
+				{
+					return 0.1f;
+				}
+				const int32 Calls = DDC::RefundHook::GetCallsWithActor() - CallsWithActorBefore;
+				Check(Calls > 0, TEXT("game passes building overflow to the hook"), FString::Printf(TEXT("%d call(s)"), Calls));
+				const int32 Sent = SentSinceMeasure();
+				const int32 Crated = Sum(Diff(CrateItems(), CrateItemsBefore));
+				Check(Sent == ExpectedSent && Sent + Crated == ExpectedTotal, TEXT("building overflow straight to the depot"),
+					FString::Printf(TEXT("sent %d (expected %d), crates +%d, refund %d"), Sent, ExpectedSent, Crated, ExpectedTotal));
+				return 0.1f;
+			});
+
+			// 9d. The inventory still comes first: one slot holds the refund's main item with room for 20 more, so 20
+			//     land in the inventory and only the rest overflows to the depot.
+			Steps.Add([this]
+			{
+				if (!bOverflowReady)
+				{
+					return 0.1f;
+				}
+				FillInventory(false);
+				UClass* Main = MainItem(BatchRefund);
+				const int32 StackSize = FMath::Max(1, UFGItemDescriptor::GetStackSize(Main));
+				UFGInventoryComponent* Inventory = Player->GetInventory();
+				Inventory->RemoveAllFromIndex(0);
+				Inventory->AddStackToIndex(0, FInventoryStack(FMath::Max(0, StackSize - 20), Main), true);
+				MakeRoom(BatchRefund, 200);
+				ExpectedTotal = Sum(BatchRefund);
+				BeginMeasure();
+				DismantleLightweightBatch();
+				return 1.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!bOverflowReady)
+				{
+					return 0.1f;
+				}
+				const int32 Inventory = Sum(Diff(InventoryItems(), InventoryBefore));
+				const int32 Sent = SentSinceMeasure();
+				const int32 Crated = Sum(Diff(CrateItems(), CrateItemsBefore));
+				const int32 ExpectInventory = FMath::Min(20, BatchRefund.FindRef(MainItem(BatchRefund)));
+				Check(Inventory == ExpectInventory && Sent == ExpectedTotal - ExpectInventory && Crated == 0, TEXT("inventory first, overflow to the depot"),
+					FString::Printf(TEXT("inventory +%d (expected %d), sent %d, crates +%d, refund %d"), Inventory, ExpectInventory, Sent, Crated, ExpectedTotal));
+				FillInventory(false);
+				return 0.1f;
+			});
+
+			// 9e. Rate used up: the rest waits in a crate and is sent from there at the overflow rate.
+			Steps.Add([this]
+			{
+				if (!bOverflowReady)
+				{
+					return 0.1f;
+				}
+				ModSubsystem()->SetOverflowBudgetOverride(20.0f, 5.0f);
+				// Extra room: the save's own uploaders may feed the same item while the crate drains over a few seconds.
+				MakeRoom(BatchRefund, 1000);
+				ExpectedSent = DepotShare(BatchRefund);
+				ExpectedTotal = Sum(BatchRefund);
+				BeginMeasure();
+				DismantleLightweightBatch();
+				return 0.2f;
+			});
+			Steps.Add([this]
+			{
+				if (!bOverflowReady)
+				{
+					return 0.1f;
+				}
+				const int32 Sent = SentSinceMeasure();
+				const int32 Crated = Sum(Diff(CrateItems(), CrateItemsBefore));
+				Check(Sent > 0 && Sent <= 10 && Crated > 0, TEXT("rate used up: the rest waits in a crate"), FString::Printf(TEXT("sent %d so far, crates +%d"), Sent, Crated));
+				return ExpectedTotal / 20.0f + 3.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!bOverflowReady)
+				{
+					return 0.1f;
+				}
+				const int32 Sent = SentSinceMeasure();
+				const int32 Crated = Sum(Diff(CrateItems(), CrateItemsBefore));
+				Check(Sent > 0 && Sent == ExpectedSent && Sent + Crated == ExpectedTotal && ModSubsystem()->GetOverflowOwedItems() == 0, TEXT("crate overflow sent at the overflow rate"),
+					FString::Printf(TEXT("sent %d (expected %d), crates +%d, refund %d, still waiting %d"), Sent, ExpectedSent, Crated, ExpectedTotal,
+						ModSubsystem()->GetOverflowOwedItems()));
+				ModSubsystem()->SetOverflowBudgetOverride(0.0f, 0.0f);
+				return 0.1f;
+			});
+
+			// 9f. Items the depot refuses (at its limit) still go into a crate, while the rest goes to the depot.
+			Steps.Add([this]
+			{
+				if (!bOverflowReady || !ItemFull)
+				{
+					if (bOverflowReady)
+					{
+						Skip(TEXT("depot-refused overflow goes into a crate"), TEXT("no item in this depot is at its limit"));
+					}
+					return 0.1f;
+				}
+				BeginMeasure();
+				const TArray<FInventoryStack> Refund{FInventoryStack(10, ItemFull), FInventoryStack(20, ItemA)};
+				FDismantleHelpers::DropRefundOnGroundNoActor(World.Get(), Player->GetActorLocation() + FVector(300, -300, 100), nullptr, Refund, Player.Get());
+				return 0.5f;
+			});
+			Steps.Add([this]
+			{
+				if (!bOverflowReady || !ItemFull)
+				{
+					return 0.1f;
+				}
+				const FItemCounts Crated = Diff(CrateItems(), CrateItemsBefore);
+				Check(SentSinceMeasure() == 20 && Crated.FindRef(ItemFull) == 10 && Sum(Crated) == 10, TEXT("depot-refused overflow goes into a crate"),
+					FString::Printf(TEXT("sent %d (expected 20), crates +%s"), SentSinceMeasure(), *Describe(Crated)));
+				return 0.1f;
+			});
+
+			// 9g. Clean up: the player's inventory back, the option off, crate uploading on.
+			Steps.Add([this]
+			{
+				if (Player.IsValid() && bOverflowReady)
+				{
+					UFGInventoryComponent* Inventory = Player->GetInventory();
+					Inventory->Empty();
+					for (const FInventoryStack& Stack : InventoryBackup)
+					{
+						Inventory->AddStack(Stack, true);
+					}
+				}
+				Set(DDC::KeyOverflowToDepot, TEXT("false"));
 				Set(DDC::KeyEnabled, TEXT("true"));
 				return 0.5f;
 			});

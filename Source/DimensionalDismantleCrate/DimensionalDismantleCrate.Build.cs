@@ -9,6 +9,7 @@ public class DimensionalDismantleCrate : ModuleRules
 
 		// Development-only test harness (crate spawning, the automatic test run, the client crate log).
 		// 0 for release builds; set 1 locally to run Tools/run_autotest.ps1 or Tools/tests/ddc_ds_test.sh.
+		// The dismantle steps of the test also need Config/AccessTransformers.ini, which is deleted for release builds.
 		PublicDefinitions.Add("DDC_DEV_COMMANDS=0");
 
 		// FactoryGame transitive dependencies (same set as the SML starter template, trimmed to what is used).

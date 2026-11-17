@@ -40,13 +40,13 @@ namespace
 
 	FAutoConsoleCommandWithWorldArgsAndOutputDevice GSetCommand(
 		TEXT("DDC.Set"),
-		TEXT("DDC.Set <Enabled|IncludeDeathCrates|UploadDeathCrateEquipment> <true|false>, or DDC.Set RateMode <PerCrate|Shared|PerSlot> - changes and saves a setting on the host or server."),
+		TEXT("DDC.Set <Enabled|IncludeDeathCrates|UploadDeathCrateEquipment|SendDismantleOverflowToDepot> <true|false>, or DDC.Set RateMode <PerCrate|Shared|PerSlot> - changes and saves a setting on the host or server."),
 		FConsoleCommandWithWorldArgsAndOutputDeviceDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World, FOutputDevice& Ar)
 		{
 			if (Args.Num() != 2)
 			{
-				Ar.Logf(TEXT("Usage: DDC.Set <%s|%s|%s> <true|false>, or DDC.Set %s <PerCrate|Shared|PerSlot>"),
-					DDC::KeyEnabled, DDC::KeyIncludeDeathCrates, DDC::KeyUploadDeathCrateEquipment, DDC::KeyRateMode);
+				Ar.Logf(TEXT("Usage: DDC.Set <%s|%s|%s|%s> <true|false>, or DDC.Set %s <PerCrate|Shared|PerSlot>"),
+					DDC::KeyEnabled, DDC::KeyIncludeDeathCrates, DDC::KeyUploadDeathCrateEquipment, DDC::KeyOverflowToDepot, DDC::KeyRateMode);
 				return;
 			}
 			FString Message;

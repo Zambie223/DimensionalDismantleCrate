@@ -2,6 +2,11 @@
 
 All notable changes after the first public release are listed here.
 
+## 0.2.0
+
+- **New setting: Send dismantle overflow straight to the depot** (off by default). When you dismantle something and your inventory is full, the items that don't fit go straight into the Dimensional Depot instead of a dismantle crate, without the upload wait, as long as the depot has room. Your inventory is still filled first, and items the depot can't take still go into a crate. In multiplayer, very large amounts arrive over a few seconds.
+- The "Upload crates to the Dimensional Depot" setting now only turns crate uploading on or off; the new setting works either way.
+
 ## 0.1.1
 
 - **Now on the Satisfactory Mod Repository**, so it can be installed and updated with Satisfactory Mod Manager.

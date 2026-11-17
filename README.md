@@ -6,6 +6,7 @@ Dismantle crates upload their contents to the **Dimensional Depot** by themselve
 - Items the depot can't take (it's full of them, or the game doesn't allow uploading them) stay in the crate, and the other items keep uploading. A crate disappears once it's empty, just as it does when you empty it by hand.
 - Works only after the **Dimensional Depot research** is done and **at least one uploader is built**.
 - Death crates are left alone unless you turn that on in Mod Options.
+- **Optional:** when you dismantle with a full inventory, the items that don't fit can go straight into the depot instead of a crate (off by default).
 - **Only the host or server needs the mod.** Players without it can join.
 
 ## Installation
@@ -28,10 +29,11 @@ Open **Mods → Dimensional Dismantle Crate** from the main menu or the pause me
 
 | Setting | Default | What it does |
 |---|---|---|
-| Upload crates to the Dimensional Depot | On | Turns the mod on or off. |
+| Upload crates to the Dimensional Depot | On | Turns crate uploading on or off. The dismantle overflow setting below works either way. |
 | Upload speed | Per crate | **Per crate:** every crate uploads like one uploader. **Shared:** all crates together upload like one uploader, taking turns. **Per stack slot:** every filled slot in a crate uploads like one uploader (much faster for big crates). Research and other mods that change the depot's upload speed apply in every mode. |
 | Also upload death crates | Off | Also upload the crates players drop when they die. |
 | Upload equipment from death crates | Off | Only matters when death crates are uploaded. While off, equipment and items that store something (fuel, ammo, ...) stay in the death crate. **Risk:** the depot only stores item counts, so anything an item stores is lost when it's uploaded. |
+| Send dismantle overflow straight to the depot | Off | When you dismantle something and your inventory is full, the items that don't fit go straight into the depot, without the upload wait, as long as it has room. Your inventory is still filled first, and items the depot can't take still go into a crate. Needs the same research and uploader as crate uploading. |
 
 Dismantle crates follow the same upload rules as the game's own uploads: anything the game lets you upload from your inventory can be uploaded from a crate.
 
@@ -52,7 +54,8 @@ Dedicated servers have no menu. Use either of these:
       "RateMode": 0,
       "IncludeDeathCrates": false,
       "UploadDeathCrateEquipment": false,
-      "SML_ModVersion_DoNotChange": "0.1.1"
+      "SendDismantleOverflowToDepot": false,
+      "SML_ModVersion_DoNotChange": "0.2.0"
   }
   ```
   Then restart the server.
@@ -70,15 +73,19 @@ Dedicated servers have no menu. Use either of these:
 - **Many crates:** 200 crates that can't upload anything cost about 0.1 ms per frame in testing.
 - **Saves:** nothing is written into your save. An upload interval that was in progress when you saved restarts after loading, so at most one item's worth of time is lost. Removing the mod leaves crates as they are.
 - **Other crates:** crates created by other mods without a dismantle or death crate type are left alone.
+- **Dismantle overflow in multiplayer:** every item sent to the depot is a network message to every player, the same as an uploader. So with players connected, overflow goes to the depot at up to 3,000 items per second. A very large dismantle puts the rest into a crate for a moment, and it is sent from there at the same rate. In single player there is effectively no limit.
+- **Dismantle overflow and saves:** if you save while overflow is still being sent from a crate, the rest uploads at normal crate speed after loading.
+- **How the overflow is caught:** the mod hooks the game function that turns dismantle leftovers into a crate (its only hook; everything else uses the game's public functions). If a game update changes how dismantle leftovers are handled, this setting may stop working until the mod is updated.
 
 ## Status
 
-Version 0.1.1 has been tested on Windows in single player and on Windows and Linux dedicated servers with a joined player (with and without the mod), using a late-game save with 16 uploaders. An automated in-game test of 19 checks passed in every one of these setups, and the Mod Options menu was checked in the release build. The checks cover:
+Version 0.2.0 has been tested on Windows in single player and on Windows and Linux dedicated servers with a joined player (with and without the mod), using a late-game save with 16 uploaders. An automated in-game test of 29 checks passed in every one of these setups, and the Mod Options menu was checked in the release build. The checks cover:
 - upload speed in all three modes, matching a vanilla uploader (240 items/min at full research)
 - depot counts matching what left the crates, and items the depot is full of staying in the crate while the rest upload
 - death crates ignored by default, uploaded with the option, and equipment kept back unless that option is on
 - crates that wait while the depot is full and start again once it has room
 - empty crates disappearing, turning the mod off, and 200 idle crates
+- dismantle overflow, using the game's own dismantle with a full inventory for both foundations and buildings: a crate as before with the setting off; with it on, the overflow sent straight to the depot with no crate, the inventory filled first, items the depot is full of going into a crate, and items held back by the rate limit (tested with a lowered limit) sent from the crate shortly after
 - the Mod Options menu, the config file and resetting to defaults
 
 It has not been tested in an internet game across several PCs; all multiplayer tests ran on one PC.
@@ -91,7 +98,7 @@ It has not been tested in an internet game across several PCs; all multiplayer t
 
 `Tools/create_config_asset.py` creates or updates the Mod Options assets (`Content/DDCConfiguration.uasset` and the dropdown labels in `Content/DDCRateModeEnum.uasset`), and `Tools/verify_config_asset.py` checks them. Both run headless in the editor, with instructions at the top of each file. `Tools/make_icon.py` redraws the icon and needs Python with Pillow.
 
-The automated in-game tests are compiled in only when `DDC_DEV_COMMANDS` is set to 1 in `Source/DimensionalDismantleCrate/DimensionalDismantleCrate.Build.cs` (it is 0 for releases). `Tools/run_autotest.ps1` runs them in single player and `Tools/tests/ddc_ds_test.sh` on a dedicated server; both expect a test save with the Dimensional Depot researched and an uploader built, and their paths point at a local test setup that you will need to adjust.
+The automated in-game tests are compiled in only when `DDC_DEV_COMMANDS` is set to 1 in `Source/DimensionalDismantleCrate/DimensionalDismantleCrate.Build.cs` (it is 0 for releases). The dismantle steps of the test call a protected game function, so a test build also needs a `Config/AccessTransformers.ini` containing `[AccessTransformers]` and `Friend=(Class="UFGBuildGunStateDismantle", FriendClass="FDDCDevDismantleAccess")`; it is not part of the repository because release builds don't use it. `Tools/run_autotest.ps1` runs them in single player and `Tools/tests/ddc_ds_test.sh` on a dedicated server; both expect a test save with the Dimensional Depot researched and an uploader built, and their paths point at a local test setup that you will need to adjust.
 
 ## License
 

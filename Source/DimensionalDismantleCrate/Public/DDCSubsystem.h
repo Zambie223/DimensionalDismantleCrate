@@ -12,16 +12,18 @@ class AFGCrate;
 struct FInventoryStack;
 class UConfigPropertySection;
 class UFGInventoryComponent;
+class UFGItemDescriptor;
 class UFGSchematic;
 
 /**
  * Uploads the contents of dismantle crates (and optionally death crates) to the Dimensional Depot, at the speed of a
- * Dimensional Depot Uploader, whenever the depot has room.
+ * Dimensional Depot Uploader, whenever the depot has room. Optionally sends dismantle overflow (the refund that
+ * doesn't fit the player's inventory) straight to the depot instead of into a crate (DDCRefundHook.cpp).
  *
  * Runs only on the server (or in single player / on a listen host) and is never replicated: clients don't need the
  * mod, because crate contents and depot counts already replicate through the game's own objects.
- * Uses only public game API: AFGCentralStorageSubsystem::UploadItemFromInventoryToCentralStorage moves one item
- * and refuses it when the depot is at its limit, exactly as the uploader uses it.
+ * Uploads use only public game API: AFGCentralStorageSubsystem::UploadItemFromInventoryToCentralStorage moves one
+ * item and refuses it when the depot is at its limit, exactly as the uploader uses it.
  */
 UCLASS()
 class DIMENSIONALDISMANTLECRATE_API ADimensionalDismantleCrateSubsystem : public AModSubsystem
@@ -45,15 +47,25 @@ public:
 
 	virtual void Tick(float DeltaSeconds) override;
 
+	/**
+	 * Dismantle overflow (the refund that didn't fit the player's inventory), called by the refund hook on the server
+	 * before the game puts it into a crate. Sends what it can straight to the depot and returns what is left for the
+	 * crate in OutRemaining. Returns false if the option is off or the gate is closed (the refund is then untouched).
+	 */
+	bool SendOverflowToDepot(const TArray<FInventoryStack>& Refund, TArray<FInventoryStack>& OutRemaining);
+
 #if DDC_DEV_COMMANDS
-	/** DEV: true if uploading is allowed right now (Dimensional Depot research done and at least one uploader built). */
-	bool IsUploadingAllowed() { return IsGateOpen(); }
+	/** DEV: true if uploading is allowed right now (Dimensional Depot research done and at least one uploader built). */	bool IsUploadingAllowed() { return IsGateOpen(); }
 	/** DEV: average and worst game-thread cost of this subsystem's Tick since the last reset, in microseconds. */
 	void ResetTickStats() { TickSecondsTotal = 0.0; TickSecondsMax = 0.0; TickCount = 0; }
 	double GetAverageTickMicroseconds() const { return TickCount > 0 ? TickSecondsTotal * 1.0e6 / TickCount : 0.0; }
 	double GetMaxTickMicroseconds() const { return TickSecondsMax * 1.0e6; }
 	int64 GetTickCount() const { return TickCount; }
 	int32 GetTrackedCrateCount() const { return Crates.Num(); }
+	/** DEV: overrides the overflow rate and burst (0 restores the defaults), so the test can exercise the crate fallback. */
+	void SetOverflowBudgetOverride(float ItemsPerSecond, float Burst) { DevOverflowRate = ItemsPerSecond; DevOverflowBurst = Burst; OverflowTokens = 0.0f; }
+	int64 GetItemsSentDirectly() const { return ItemsSentDirectly; }
+	int32 GetOverflowOwedItems() const;
 #endif
 
 protected:
@@ -107,6 +119,16 @@ private:
 	bool TryUploadSlot(UFGInventoryComponent* Inventory, int32 SlotIndex, AFGCentralStorageSubsystem* CentralStorage, bool bSkipEquipment);
 	void NoteUpload();
 
+	// Dismantle overflow straight to the depot
+	/** True if there is a network connection to at least one player, so every upload is a network message. */
+	bool HasRemoteClients() const;
+	/** Adds this frame's share of the overflow rate to OverflowTokens. */
+	void RefillOverflowTokens();
+	/** Sends overflow items that went into crates (because the rate was used up) from those crates, newest first. */
+	void TickOverflowFromCrates(AFGCentralStorageSubsystem* CentralStorage);
+	/** One-slot inventory the refund passes through, since the game only uploads from an inventory slot. */
+	UFGInventoryComponent* GetScratchInventory();
+
 	TArray<FTrackedCrate> Crates;
 	/** The crates in Crates, for constant-time duplicate checks when crates are found again by spawn events or rescans. */
 	TSet<TObjectKey<AFGCrate>> TrackedKeys;
@@ -124,6 +146,18 @@ private:
 	DDC::ERateMode RateMode = DDC::ERateMode::PerCrate;
 	bool bIncludeDeathCrates = false;
 	bool bUploadDeathCrateEquipment = false;
+	bool bOverflowToDepot = false;
+
+	/**
+	 * Overflow items per item class that should have gone straight to the depot but went into a crate because the
+	 * rate was used up. They are sent from dismantle crates at the overflow rate. Not saved: after a reload the
+	 * rest uploads at normal crate speed.
+	 */
+	TMap<TSubclassOf<UFGItemDescriptor>, int32> OverflowOwed;
+	float OverflowTokens = 0.0f;
+	double OverflowTokensRefilledAt = -1.0;
+	UPROPERTY(Transient)
+	TObjectPtr<UFGInventoryComponent> ScratchInventory;
 
 	// Gate
 	UPROPERTY(Transient)
@@ -138,8 +172,12 @@ private:
 	int64 ItemsUploaded = 0;
 	double FirstUploadSeconds = -1.0;
 	double LastUploadSeconds = -1.0;
+	/** Dismantle overflow items sent to the depot, directly or from a crate at the overflow rate (not in ItemsUploaded). */
+	int64 ItemsSentDirectly = 0;
 
 #if DDC_DEV_COMMANDS
+	float DevOverflowRate = 0.0f;
+	float DevOverflowBurst = 0.0f;
 	double TickSecondsTotal = 0.0;
 	double TickSecondsMax = 0.0;
 	int64 TickCount = 0;

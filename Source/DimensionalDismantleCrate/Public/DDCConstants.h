@@ -18,6 +18,19 @@ namespace DDC
 	inline constexpr const TCHAR* KeyRateMode = TEXT("RateMode");
 	inline constexpr const TCHAR* KeyIncludeDeathCrates = TEXT("IncludeDeathCrates");
 	inline constexpr const TCHAR* KeyUploadDeathCrateEquipment = TEXT("UploadDeathCrateEquipment");
+	inline constexpr const TCHAR* KeyOverflowToDepot = TEXT("SendDismantleOverflowToDepot");
+
+	/**
+	 * Items per second that "send dismantle overflow straight to the depot" may move, and how many may go at once.
+	 * Every item is one reliable network message to every player (the depot has no bulk add), so with players connected
+	 * the rate stays inside what the uploader tests showed is safe (about 5,200 messages per second on a dedicated
+	 * server). Without connected players there are no messages, and the cap only bounds the cost of one frame.
+	 * Whatever doesn't fit goes into a dismantle crate and is sent from there at this rate.
+	 */
+	inline constexpr float OverflowItemsPerSecondNetworked = 3000.0f;
+	inline constexpr float OverflowBurstNetworked = 150.0f;
+	inline constexpr float OverflowItemsPerSecondLocal = 100000.0f;
+	inline constexpr float OverflowBurstLocal = 5000.0f;
 
 	/**
 	 * Values of KeyRateMode, stored as integers in the config file, so never renumber them.
