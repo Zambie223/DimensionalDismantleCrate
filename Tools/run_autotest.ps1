@@ -1,5 +1,7 @@
 # Runs the dev-only automatic test (-DDCAutoTest) in the shared M: GameCopy on the test save, then cleans up.
 # Requires a DEV package (DDC_DEV_COMMANDS=1) installed with Tools\gamecopy_mod.ps1 -Install.
+# -SmokeSeconds N: for a RELEASE package (no auto-test). Waits until the mod reports its upload gate, keeps the game
+# running N more seconds, then reports the mod's log lines and any crash (result SMOKE-OK / CRASH / TIMEOUT).
 #
 # Save safety (the game reads and writes the REAL save folder even with -userdir):
 #  - Use a test save whose in-save session name is unique (-TestSession), so its autosaves get their own names.
@@ -15,8 +17,9 @@ param(
     [string]$TestSave = 'DDCTest',              # save file name without .sav, in the Steam save folder
     [string]$TestSession = 'DDCTest',           # the session name stored inside that save
     [string]$ProtectSession = '',               # optional: real session whose autosaves must stay untouched
-    [string]$GameDir = 'M:\Satismod\GameCopy',  # test copy of the game (never the real install)
-    [string]$UserDir = 'M:/Satismod/GameCopyUser',
+    [string]$GameDir = 'M:\Satismod\GameCopy-1.2.5.1',  # test copy of the game (never the real install)
+    [string]$UserDir = 'M:/Satismod/GameCopy1251User',
+    [int]$SmokeSeconds = 0,
     [string]$BackupRoot = 'M:\Satismod\backups'
 )
 $ErrorActionPreference = 'Stop'
@@ -51,21 +54,29 @@ $proc = Start-Process $Exe -ArgumentList @("-userdir=$UserDir", '-windowed', '-R
 Add-Type -Namespace DDC -Name Win -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetWindowPos(System.IntPtr h, System.IntPtr a, int x, int y, int cx, int cy, uint f);
 '@
+# Only processes started from the test copy are ours (the user's own game may run from the real install).
+function Get-TestGame { Get-Process FactoryGameSteam-Win64-Shipping -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$GameDir\*" } }
 $moved = $false
+$smokeUntil = $null
 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 $result = 'TIMEOUT'
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 5
-    if (-not $moved) {
-        $game = Get-Process FactoryGameSteam-Win64-Shipping -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-        if ($game) { [DDC.Win]::SetWindowPos($game.MainWindowHandle, [IntPtr]::Zero, -4000, 0, 0, 0, 0x0001 -bor 0x0004 -bor 0x0010) | Out-Null; $moved = $true; 'window moved off-screen' }
+    # Every pass: Unreal's splash window is replaced by the game window, so moving the first handle once isn't enough.
+    $game = Get-TestGame | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+    if ($game) {
+        [DDC.Win]::SetWindowPos($game.MainWindowHandle, [IntPtr]::Zero, -4000, 0, 0, 0, 0x0001 -bor 0x0004 -bor 0x0010) | Out-Null
+        if (-not $moved) { 'window moved off-screen' }
+        $moved = $true
     }
     if ((Test-Path $Log) -and (Get-Item $Log).LastWriteTime -gt $logStart) {
         $text = Get-Content $Log -Raw -ErrorAction SilentlyContinue
-        if ($text -match '\[DDCTest\] DONE') { $result = 'DONE'; break }
+        if ($SmokeSeconds -le 0 -and $text -match '\[DDCTest\] DONE') { $result = 'DONE'; break }
+        if ($SmokeSeconds -gt 0 -and -not $smokeUntil -and $text -match 'LogDimensionalDismantleCrate: Crate uploading') { $smokeUntil = (Get-Date).AddSeconds($SmokeSeconds); "upload gate reported; watching $SmokeSeconds s" }
+        if ($smokeUntil -and (Get-Date) -ge $smokeUntil) { $result = 'SMOKE-OK'; break }
         if ($text -match 'Critical error|Fatal error|=== Critical') { $result = 'CRASH'; break }
     }
-    if (-not (Get-Process FactoryGameSteam-Win64-Shipping -ErrorAction SilentlyContinue) -and $moved) { $result = 'EXITED'; break }
+    if (-not (Get-TestGame) -and $moved) { $result = 'EXITED'; break }
 }
 "result: $result"
 
@@ -74,11 +85,11 @@ while ((Get-Date) -lt $deadline) {
 Get-ChildItem $Saves -File -Filter "$TestSession*" | Where-Object { $_.Name -notin $before.Name } |
     ForEach-Object { Remove-Item $_.FullName -Force; "deleted test autosave $($_.Name) (game still running)" }
 # Then close the game by force (graceful close doesn't work from the shell).
-Get-Process FactoryGameSteam*, CrashReportClient* -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process FactoryGameSteam*, CrashReportClient*, crashpad_handler -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$GameDir\*" } | Stop-Process -Force
 Start-Sleep -Seconds 3
 
 # 4. Results.
-Select-String -Path $Log -Pattern '\[DDCTest\]|LogDimensionalDismantleCrate: (Warning|Error)' | ForEach-Object { $_.Line -replace '^\[[^\]]*\]\[[^\]]*\]', '' }
+Select-String -Path $Log -Pattern '\[DDCTest\]|LogDimensionalDismantleCrate: |LogSatisfactoryModLoader: .*(DimensionalDismantleCrate|Mod Loader|version)|Critical error|Fatal error' | ForEach-Object { $_.Line -replace '^\[[^\]]*\]\[[^\]]*\]', '' }
 Copy-Item $Log "$Backup\FactoryGame.log"
 
 # 5. Save folder: restore changed real autosaves, report and delete new test files.
