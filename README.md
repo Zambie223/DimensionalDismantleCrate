@@ -91,7 +91,7 @@ Dedicated servers have no menu. Use either of these:
 
 ## Status
 
-Version 0.3.0 has been tested on Windows in single player and on Windows and Linux dedicated servers with a joined player (with and without the mod), using a late-game save with 16 uploaders. An automated in-game test of 45 checks passed in every one of these setups. The release build was then run in single player and on both servers without errors from the mod, and its Mod Options menu was checked. The checks cover:
+Version 0.3.0 has been tested on game 1.2.5.1 with SML 3.12.1, using a late-game save with 16 uploaders. An automated in-game test of 45 checks, run on a development build of the same code, passed in single player, on a Windows dedicated server with a joined player (once with the mod and once without it) and on a Linux dedicated server with a joined player without the mod. The release build was then run in single player, on the Windows server with a joined player who had the mod and on the Linux server with a joined player who didn't, without errors from the mod, and its Mod Options menu was checked. The checks cover:
 - upload speed in Per crate, Shared and Per stack slot mode, matching a vanilla uploader (240 items/min at full research); Shared by all uploaders at 16 uploaders' speed; Instant emptying crates within a few frames
 - depot counts matching what left the crates, and items the depot is full of staying in the crate while the rest upload
 - death crates ignored by default, uploaded with the option, and equipment kept back unless that option is on
@@ -104,7 +104,7 @@ Version 0.3.0 has been tested on Windows in single player and on Windows and Lin
 - chat notices: an item the depot is full of is named once and not repeated within 5 minutes, an item with room isn't reported, equipment a death crate keeps isn't reported, and the "no uploader built" message goes out once. The messages were seen on the screen of a joined player without the mod, on both the Windows and the Linux server.
 - the cost of the inventory hook (see Limits and notes)
 
-It has not been tested in an internet game across several PCs; all multiplayer tests ran on one PC.
+Not tested: a player joining someone who hosts from the game itself (the multiplayer tests used dedicated servers), and an internet game across several PCs; all multiplayer tests ran on one PC.
 
 ## Building from source
 
