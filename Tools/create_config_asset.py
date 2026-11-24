@@ -5,7 +5,7 @@ Run headless from the project root (the editor must not be open, and the editor 
 Output goes to Saved/Logs/FactoryGame.log, lines tagged [DDC].
 
 The asset is a Blueprint because SML's Mod Options widgets come from its Blueprint property classes.
-Keys must match DDCConstants.h; RateMode values must match EDDCRateMode in DDCRateMode.h.
+Keys must match DDCConstants.h; RateMode values must match DDC::ERateMode in DDCConstants.h.
 """
 import unreal
 
@@ -18,7 +18,7 @@ SML_PROPS = "/SML/Interface/UI/Menu/Mods/ConfigProperties"
 # so the game showed "PerCrate". Order must match DDC::ERateMode in DDCConstants.h (the config stores the index).
 RATE_MODE_ENUM_NAME = "DDCRateModeEnum"
 RATE_MODE_ENUM_PATH = f"{ASSET_DIR}/{RATE_MODE_ENUM_NAME}"
-RATE_MODE_LABELS = ["Per crate", "Shared", "Per stack slot"]
+RATE_MODE_LABELS = ["Per crate", "Shared", "Per stack slot", "Instant", "Shared by all uploaders"]
 
 HOST_NOTE = "In multiplayer only the host's or server's setting is used."
 
@@ -41,11 +41,14 @@ PROPERTIES = [
             "Per crate: every crate uploads like one Dimensional Depot Uploader.\n"
             "Shared: all crates together upload like one uploader, taking turns.\n"
             "Per stack slot: every filled slot in a crate uploads like one uploader (much faster for big crates).\n"
-            "Upload speed research and other mods that change the depot's upload speed apply in every mode.\n" + HOST_NOTE
+            "Instant: crates empty right away (in multiplayer, up to a few thousand items per second).\n"
+            "Shared by all uploaders: all crates together upload like every uploader you have built, taking turns.\n"
+            "Upload speed research and other mods that change the depot's upload speed apply in every mode except Instant.\n"
+            + HOST_NOTE
         ),
         "default": 0,
         "min": 0,
-        "max": 2,
+        "max": 4,
     },
     {
         "key": "IncludeDeathCrates",
@@ -79,6 +82,42 @@ PROPERTIES = [
             "Items the depot can't take still go into a crate. In multiplayer, very large amounts arrive over a few seconds.\n"
             "Needs the Dimensional Depot research and at least one uploader built. Works whether or not crates upload.\n"
             + HOST_NOTE
+        ),
+        "default": False,
+    },
+    {
+        "key": "RefundsFollowDepotPreference",
+        "type": "bool",
+        "display_name": "Dismantle refunds follow each player's depot setting",
+        "tooltip": (
+            "On: when a player dismantles, their own \"take from inventory before depot\" setting (in the inventory screen)\n"
+            "also decides where the refund goes. With that setting off, the refund goes to the Dimensional Depot first,\n"
+            "and only what the depot can't take goes to their inventory (and then a crate). With it on, nothing changes.\n"
+            "Off: refunds go to the inventory first for everyone, as in the base game.\n"
+            "Needs the Dimensional Depot research and at least one uploader built.\n" + HOST_NOTE
+        ),
+        "default": False,
+    },
+    {
+        "key": "SinkWhenDepotFull",
+        "type": "bool",
+        "display_name": "Sink what the depot is full of",
+        "tooltip": (
+            "Items in dismantle crates that the Dimensional Depot is full of go to the AWESOME Sink for points instead of\n"
+            "staying in the crate, at the same speed as uploading. Needs at least one AWESOME Sink built.\n"
+            "Never touches death crates, equipment, items that store something, or items worth no points.\n"
+            "The items are gone once sunk.\n" + HOST_NOTE
+        ),
+        "default": False,
+    },
+    {
+        "key": "ShowStuckNotices",
+        "type": "bool",
+        "display_name": "Say why crates aren't emptying",
+        "tooltip": (
+            "Posts a short chat message when items in crates can't upload, for example because the Dimensional Depot is\n"
+            "full of them, or when crates wait for an uploader to be built. At most one message every 30 seconds, and the\n"
+            "same item at most every 5 minutes. Every player sees the messages.\n" + HOST_NOTE
         ),
         "default": False,
     },

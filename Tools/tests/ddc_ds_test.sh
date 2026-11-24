@@ -37,6 +37,7 @@ wsl_run() { MSYS_NO_PATHCONV=1 wsl.exe -d EasyDDLinux -u ubuntu -- bash -c "$1" 
 cmd() { echo "> $*"; bash "$DS" cmd "$*"; }
 # Only processes started from the test copy are ours; the user's own game may be running from the real install.
 kill_client() {
+  [ -n "${SHOT_PID:-}" ] && kill "$SHOT_PID" 2>/dev/null
   powershell.exe -NoProfile -Command "Get-Process FactoryGameSteam*, CrashReportClient*, crashpad_handler -ErrorAction SilentlyContinue | Where-Object { \$_.Path -like '$GAMECOPY_WIN*' } | Stop-Process -Force"
 }
 # Call repeatedly: Unreal's splash window is replaced by the real game window, which opens on-screen again.
@@ -89,6 +90,27 @@ if [ "$WITH_CLIENT" = client ]; then
     sleep 5
   done
   for k in 1 2 3 4; do offscreen; sleep 10; done   # let the remote pawn spawn
+
+  # Chat notices on the player's screen: after each of the first four "Notice:" lines in the server log, the client
+  # window is captured 2 s and 6 s later (works with or without the mod on the client). Saved to $SHOT_DIR.
+  SHOT_DIR="${DDC_SHOT_DIR:-/m/Satismod/BuildTemp/ddc-shots}"
+  mkdir -p "$SHOT_DIR"
+  SHOT_TAG="$(date +%Y%m%d-%H%M%S)-$TARGET"
+  SHOT_PREFIX="$(cygpath -w "$SHOT_DIR")\\$SHOT_TAG"
+  (
+    seen=0
+    for i in $(seq 1 900); do
+      kill -0 $$ 2>/dev/null || break   # the test script is gone
+      n=$(server_log | grep -ac 'LogDimensionalDismantleCrate: Notice:')
+      if [ "$n" -gt "$seen" ] && [ "$seen" -lt 4 ]; then
+        seen=$n
+        sleep 2; powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HERE_WIN/capture_client.ps1" -Out "$SHOT_PREFIX-notice$n-a.png" -GameDir "$GAMECOPY_WIN" | tr -d '\r'
+        sleep 4; powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HERE_WIN/capture_client.ps1" -Out "$SHOT_PREFIX-notice$n-b.png" -GameDir "$GAMECOPY_WIN" | tr -d '\r'
+      fi
+      sleep 1
+    done
+  ) &
+  SHOT_PID=$!
 fi
 
 if [ "$SMOKE" = 1 ]; then
@@ -99,12 +121,12 @@ if [ "$SMOKE" = 1 ]; then
 else
   echo "== auto-test on the server"
   cmd "DDC.Dev.RunTests"
-  for i in $(seq 1 120); do
+  for i in $(seq 1 180); do
     if server_log | grep -aq '\[DDCTest\] DONE'; then break; fi
     offscreen
     sleep 5
   done
-  server_log | grep -a '\[DDCTest\]\|Gate:\|Uploaded since' | sed 's/^\[[^]]*\]\[[^]]*\]//' | tail -100
+  server_log | grep -a '\[DDCTest\]\|Gate:\|Uploaded since' | sed 's/^\[[^]]*\]\[[^]]*\]//' | tail -200
   cmd "DDC.Dev.Crates"
   cmd "DDC.Status"
 fi
@@ -113,6 +135,10 @@ if [ -n "$CLIENT_PID" ]; then
   sleep 12
   echo "== client view (last lines):"
   grep -a '\[DDCClient\]\|NMT_Failure\|LogNet: .*Welcomed\|Join succeeded\|Critical error\|Fatal error' "$CLIENT_LOG" | sed 's/^\[[^]]*\]\[[^]]*\]//' | tail -12 | cut -c1-400
+  echo "== chat messages the client received (modded client only; a vanilla client has the screenshots):"
+  grep -a '\[DDCClient\] chat' "$CLIENT_LOG" | sed 's/^\[[^]]*\]\[[^]]*\]//' | cut -c1-500
+  kill "$SHOT_PID" 2>/dev/null
+  echo "== client screenshots: $(ls "$SHOT_DIR" | grep -c "^$SHOT_TAG-") in $SHOT_DIR ($SHOT_TAG-*)"
 fi
 
 echo "== stopping"

@@ -6,16 +6,21 @@ Dismantle crates upload their contents to the **Dimensional Depot** by themselve
 - Items the depot can't take (it's full of them, or the game doesn't allow uploading them) stay in the crate, and the other items keep uploading. A crate disappears once it's empty, just as it does when you empty it by hand.
 - Works only after the **Dimensional Depot research** is done and **at least one uploader is built**.
 - Death crates are left alone unless you turn that on in Mod Options.
-- **Optional:** when you dismantle with a full inventory, the items that don't fit can go straight into the depot instead of a crate (off by default).
+- **Optional** (all off by default):
+  - when you dismantle with a full inventory, the items that don't fit go straight into the depot instead of a crate
+  - dismantle refunds go to the depot first for players whose own "take from inventory before depot" setting is off
+  - items the depot is full of go to the AWESOME Sink for points
+  - a chat message says why crates aren't emptying
+  - faster upload speeds: Instant, or as fast as all your uploaders together
 - **Only the host or server needs the mod.** Players without it can join.
 
 ## Installation
 
-You need Satisfactory 1.2 (build 517554 or newer).
+You need Satisfactory 1.2.5.1 (build 520140) or newer.
 
 **With Satisfactory Mod Manager (recommended):** search for *Dimensional Dismantle Crate* in [Satisfactory Mod Manager](https://docs.ficsit.app/satisfactory-modding/latest/ForUsers/SatisfactoryModManager.html), or open its page on the [Satisfactory Mod Repository](https://ficsit.app/mod/DimensionalDismantleCrate) and choose Install. The mod manager also installs Satisfactory Mod Loader (SML) and keeps the mod up to date.
 
-**By hand**, from this repository's releases (you also need Satisfactory Mod Loader (SML) 3.12 or newer installed):
+**By hand**, from this repository's releases (you also need Satisfactory Mod Loader (SML) 3.12.1 or newer installed):
 
 1. From the Releases page, download the zip for where it will run:
    - `DimensionalDismantleCrate-Windows.zip` for your game
@@ -30,10 +35,13 @@ Open **Mods → Dimensional Dismantle Crate** from the main menu or the pause me
 | Setting | Default | What it does |
 |---|---|---|
 | Upload crates to the Dimensional Depot | On | Turns crate uploading on or off. The dismantle overflow setting below works either way. |
-| Upload speed | Per crate | **Per crate:** every crate uploads like one uploader. **Shared:** all crates together upload like one uploader, taking turns. **Per stack slot:** every filled slot in a crate uploads like one uploader (much faster for big crates). Research and other mods that change the depot's upload speed apply in every mode. |
+| Upload speed | Per crate | **Per crate:** every crate uploads like one uploader. **Shared:** all crates together upload like one uploader, taking turns. **Per stack slot:** every filled slot in a crate uploads like one uploader (much faster for big crates). **Instant:** crates empty as fast as the depot can take the items. **Shared by all uploaders:** all crates together upload like every uploader you have built, taking turns. Research and other mods that change the depot's upload speed apply in every mode except Instant. |
 | Also upload death crates | Off | Also upload the crates players drop when they die. |
 | Upload equipment from death crates | Off | Only matters when death crates are uploaded. While off, equipment and items that store something (fuel, ammo, ...) stay in the death crate. **Risk:** the depot only stores item counts, so anything an item stores is lost when it's uploaded. |
 | Send dismantle overflow straight to the depot | Off | When you dismantle something and your inventory is full, the items that don't fit go straight into the depot, without the upload wait, as long as it has room. Your inventory is still filled first, and items the depot can't take still go into a crate. Needs the same research and uploader as crate uploading. |
+| Dismantle refunds follow each player's depot setting | Off | When on, each player's own **take from inventory before depot** setting (in the inventory screen) also decides where their dismantle refunds go. With that setting off, the refund goes to the depot first, then to the inventory, then into a crate. With it on, nothing changes. **Note:** the game's default for that setting is off, so players who never changed it get depot-first refunds once you turn this on. Needs the same research and uploader as crate uploading. |
+| Sink what the depot is full of | Off | Items in dismantle crates that the depot has no room for go to the AWESOME Sink for points instead of waiting in the crate, at the same speed as uploading. Needs at least one AWESOME Sink built. Death crates, equipment, items that store something and items worth no points are never sunk. Sunk items are gone. |
+| Say why crates aren't emptying | Off | Posts a short chat message when items in crates can't upload, for example because the depot is full of them, or when no uploader is built yet. At most one message every 30 seconds, and the same item at most every 5 minutes. Every player sees the messages. |
 
 Dismantle crates follow the same upload rules as the game's own uploads: anything the game lets you upload from your inventory can be uploaded from a crate.
 
@@ -47,7 +55,7 @@ Dismantle crates follow the same upload rules as the game's own uploads: anythin
 
 Dedicated servers have no menu. Use either of these:
 
-- **Edit the config file.** It is `FactoryGame/Configs/DimensionalDismantleCrate.cfg` in the server's install folder, created on first start. `RateMode` is `0` (per crate), `1` (shared) or `2` (per stack slot):
+- **Edit the config file.** It is `FactoryGame/Configs/DimensionalDismantleCrate.cfg` in the server's install folder, created on first start. `RateMode` is `0` (per crate), `1` (shared), `2` (per stack slot), `3` (instant) or `4` (shared by all uploaders):
   ```json
   {
       "Enabled": true,
@@ -55,7 +63,10 @@ Dedicated servers have no menu. Use either of these:
       "IncludeDeathCrates": false,
       "UploadDeathCrateEquipment": false,
       "SendDismantleOverflowToDepot": false,
-      "SML_ModVersion_DoNotChange": "0.2.0"
+      "RefundsFollowDepotPreference": false,
+      "SinkWhenDepotFull": false,
+      "ShowStuckNotices": false,
+      "SML_ModVersion_DoNotChange": "0.3.0"
   }
   ```
   Then restart the server.
@@ -64,29 +75,34 @@ Dedicated servers have no menu. Use either of these:
   | Command | Effect |
   |---|---|
   | `DDC.Status` | Shows the settings, whether uploading is allowed yet (research and uploader), the upload speed, and the crates the mod sees. |
-  | `DDC.Set RateMode Shared` | Changes and saves a setting. `RateMode` takes `PerCrate`, `Shared` or `PerSlot`; the other settings take `true` or `false`, e.g. `DDC.Set IncludeDeathCrates true`. |
+  | `DDC.Set RateMode Shared` | Changes and saves a setting. `RateMode` takes `PerCrate`, `Shared`, `PerSlot`, `Instant` or `PerUploader`; the other settings take `true` or `false`, e.g. `DDC.Set IncludeDeathCrates true`. |
 
 ## Limits and notes
 
-- **Speed:** like an uploader, a crate uploads at most one item per game tick, and catches up after a hitch the same way. Very high upload speeds from other mods therefore top out at your frame rate (or the server's tick rate) per crate, or per filled slot in Per stack slot mode.
+- **Speed:** like an uploader, a crate uploads at most one item per game tick, and catches up after a hitch the same way. Very high upload speeds from other mods therefore top out at your frame rate (or the server's tick rate) per crate, or per filled slot in Per stack slot mode. Shared by all uploaders moves up to one item per uploader per tick. Instant moves up to 500 items per tick; emptying a large pile of crates that way cost up to about 1.2 ms per frame in testing.
 - **Waiting crates:** a crate with nothing the depot can take checks again every 0.25 seconds, so it starts uploading up to 0.25 seconds after the depot has room.
 - **Many crates:** 200 crates that can't upload anything cost about 0.1 ms per frame in testing.
 - **Saves:** nothing is written into your save. An upload interval that was in progress when you saved restarts after loading, so at most one item's worth of time is lost. Removing the mod leaves crates as they are.
 - **Other crates:** crates created by other mods without a dismantle or death crate type are left alone.
-- **Dismantle overflow in multiplayer:** every item sent to the depot is a network message to every player, the same as an uploader. So with players connected, overflow goes to the depot at up to 3,000 items per second. A very large dismantle puts the rest into a crate for a moment, and it is sent from there at the same rate. In single player there is effectively no limit.
+- **Network limit in multiplayer:** every item added to the depot is a network message to every player, the same as an uploader. So with players connected, the mod adds at most 3,000 items per second to the depot, shared by crate uploads, dismantle overflow and depot-first refunds; crates take turns while the limit holds them back. A very large dismantle puts the rest into a crate for a moment, and it is sent from there. In single player there is effectively no limit.
 - **Dismantle overflow and saves:** if you save while overflow is still being sent from a crate, the rest uploads at normal crate speed after loading.
-- **How the overflow is caught:** the mod hooks the game function that turns dismantle leftovers into a crate (its only hook; everything else uses the game's public functions). If a game update changes how dismantle leftovers are handled, this setting may stop working until the mod is updated.
+- **Sinking:** sunk items add their AWESOME Sink points. Sinking doesn't use the network limit.
+- **How dismantles are caught:** the mod hooks the game function that turns dismantle leftovers into a crate, the server's dismantle function, and the function that adds items to an inventory (only to redirect refunds while a dismantle runs with the depot-first setting on; everything else uses the game's public functions). The inventory hook runs for every item added anywhere in the game, so it is kept to one check: in testing it added about 20-25 ns to each call. How often the game makes that call depends on the save; even 100,000 calls per second would add up to about 2.5 ms of CPU time per second of play, spread over all threads. If a game update changes how dismantle refunds are handled, the dismantle settings may stop working until the mod is updated.
 
 ## Status
 
-Version 0.2.0 has been tested on Windows in single player and on Windows and Linux dedicated servers with a joined player (with and without the mod), using a late-game save with 16 uploaders. An automated in-game test of 29 checks passed in every one of these setups, and the Mod Options menu was checked in the release build. The checks cover:
-- upload speed in all three modes, matching a vanilla uploader (240 items/min at full research)
+Version 0.3.0 has been tested on Windows in single player and on Windows and Linux dedicated servers with a joined player (with and without the mod), using a late-game save with 16 uploaders. An automated in-game test of 45 checks passed in every one of these setups. The release build was then run in single player and on both servers without errors from the mod, and its Mod Options menu was checked. The checks cover:
+- upload speed in Per crate, Shared and Per stack slot mode, matching a vanilla uploader (240 items/min at full research); Shared by all uploaders at 16 uploaders' speed; Instant emptying crates within a few frames
 - depot counts matching what left the crates, and items the depot is full of staying in the crate while the rest upload
 - death crates ignored by default, uploaded with the option, and equipment kept back unless that option is on
 - crates that wait while the depot is full and start again once it has room
 - empty crates disappearing, turning the mod off, and 200 idle crates
-- dismantle overflow, using the game's own dismantle with a full inventory for both foundations and buildings: a crate as before with the setting off; with it on, the overflow sent straight to the depot with no crate, the inventory filled first, items the depot is full of going into a crate, and items held back by the rate limit (tested with a lowered limit) sent from the crate shortly after
-- the Mod Options menu, the config file and resetting to defaults
+- the multiplayer network limit (tested with a lowered limit): uploads stay within it and crates take turns evenly
+- dismantle overflow, using the game's own dismantle with a full inventory for both foundations and buildings: a crate as before with the setting off; with it on, the overflow sent straight to the depot with no crate, the inventory filled first, items the depot is full of going into a crate, and items held back by the rate limit sent from the crate shortly after
+- depot-first refunds, using the game's own dismantle: the refund goes to the depot for a player whose "take from inventory before depot" setting is off, to the inventory for a player who has it on, and to the inventory for everyone while the switch is off
+- sinking: a dismantle crate's items the depot is full of are sunk, and a death crate is left alone
+- chat notices: an item the depot is full of is named once and not repeated within 5 minutes, an item with room isn't reported, equipment a death crate keeps isn't reported, and the "no uploader built" message goes out once. The messages were seen on the screen of a joined player without the mod, on both the Windows and the Linux server.
+- the cost of the inventory hook (see Limits and notes)
 
 It has not been tested in an internet game across several PCs; all multiplayer tests ran on one PC.
 

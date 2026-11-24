@@ -19,10 +19,13 @@
 #include "Equipment/FGBuildGunDismantle.h"
 #include "FGCentralStorageSubsystem.h"
 #include "FGCharacterPlayer.h"
+#include "FGChatManager.h"
 #include "FGDismantleInterface.h"
 #include "FGInventoryComponent.h"
 #include "FGCrate.h"
 #include "FGLightweightBuildableSubsystem.h"
+#include "FGPlayerState.h"
+#include "FGResourceSinkSubsystem.h"
 #include "FGRecipe.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
@@ -170,7 +173,72 @@ namespace
 		bool bOverflowReady = false;
 		static constexpr int32 BatchSize = 10;
 
+		// 0.3.0 steps
+		TWeakObjectPtr<AFGCrate> CrateCapA, CrateCapB, CrateUpA, CrateUpB, CrateSink, CrateSinkDeath, CrateNotice, CrateNotice2, CrateNoticeDeath;
+		TArray<TWeakObjectPtr<AFGCrate>> BulkCrates;
+		int32 BulkItems = 0;
+		int32 Uploaders = 0;
+		float UploaderWindow = 0.0f;
+		TSubclassOf<UFGItemDescriptor> ItemSinkFull;
+		bool bSinkReady = false;
+		int64 SunkBefore = 0;
+		bool bNoticeReady = false;
+		int32 NoticesBefore = 0;
+		bool bDepotFirstReady = false;
+		bool bPreferenceBackup = true;
+		int64 RefundedBefore = 0;
+		int32 DepotFirstBefore = 0;
+
 		ADimensionalDismantleCrateSubsystem* ModSubsystem() const { return ADimensionalDismantleCrateSubsystem::Get(World.Get()); }
+
+		static FItemCounts One(UClass* Item, const int32 Count)
+		{
+			FItemCounts Counts;
+			Counts.Add(Item, Count);
+			return Counts;
+		}
+
+		static void DestroyCrate(const TWeakObjectPtr<AFGCrate>& Crate)
+		{
+			if (AFGCrate* Live = Crate.Get())
+			{
+				Live->Destroy();
+			}
+		}
+
+		AFGPlayerState* PlayerState() const { return Player.IsValid() ? Player->GetPlayerState<AFGPlayerState>() : nullptr; }
+
+		/** Item A in all crates in the world (the test's and the save's own). */
+		int32 ItemAInCrates() const { return CrateItems().FindRef(ItemA); }
+
+		/** Room the depot has for an item right now. */
+		int32 RoomFor(const TSubclassOf<UFGItemDescriptor> Item) const
+		{
+			const AFGCentralStorageSubsystem* CS = Depot();
+			return CS->GetCentralStorageItemLimit(Item) - CS->GetNumItemsFromCentralStorage(Item);
+		}
+
+		/** An item the depot holds at its limit that the AWESOME Sink takes for points (not equipment). */
+		TSubclassOf<UFGItemDescriptor> FindSinkableFullItem() const
+		{
+			AFGCentralStorageSubsystem* CS = Depot();
+			AFGResourceSinkSubsystem* Sink = AFGResourceSinkSubsystem::Get(World.Get());
+			if (!Sink)
+			{
+				return nullptr;
+			}
+			TArray<FItemAmount> Stored;
+			CS->GetAllItemsFromCentralStorage(Stored);
+			for (const FItemAmount& Amount : Stored)
+			{
+				if (Amount.ItemClass && Amount.Amount >= CS->GetCentralStorageItemLimit(Amount.ItemClass)
+					&& !Amount.ItemClass->IsChildOf(UFGEquipmentDescriptor::StaticClass()) && Sink->GetResourceSinkPointsForItem(Amount.ItemClass) > 0)
+				{
+					return Amount.ItemClass;
+				}
+			}
+			return nullptr;
+		}
 
 		FItemCounts CrateItems() const
 		{
@@ -277,6 +345,8 @@ namespace
 			CrateItemsBefore = CrateItems();
 			InventoryBefore = InventoryItems();
 			SentBefore = ModSubsystem() ? ModSubsystem()->GetItemsSentDirectly() : 0;
+			RefundedBefore = ModSubsystem() ? ModSubsystem()->GetItemsRefundedToDepot() : 0;
+			DepotFirstBefore = DDC::RefundHook::GetDepotFirstDismantles();
 			CallsWithActorBefore = DDC::RefundHook::GetCallsWithActor();
 			CallsWithoutActorBefore = DDC::RefundHook::GetCallsWithoutActor();
 			CrateCountBefore = CrateCount();
@@ -348,8 +418,8 @@ namespace
 				}
 				for (const TPair<UClass*, int32>& Recipe : PerRecipe)
 				{
-					// Five batches are used; foundations count double so a common, simple refund wins.
-					const int32 Score = Recipe.Value < 5 * BatchSize ? 0 : Recipe.Value * (Pair.Key->GetName().Contains(TEXT("Foundation")) ? 2 : 1);
+					// Eight batches are used; foundations count double so a common, simple refund wins.
+					const int32 Score = Recipe.Value < 8 * BatchSize ? 0 : Recipe.Value * (Pair.Key->GetName().Contains(TEXT("Foundation")) ? 2 : 1);
 					if (Score > BestScore)
 					{
 						BestScore = Score;
@@ -478,9 +548,464 @@ namespace
 		/** Rate check: Got items in Window seconds at Sources parallel uploaders; one item of slack each way per source. */
 		void CheckRate(const FString& Name, const int32 Got, const int32 Sources)
 		{
-			const float Expected = Sources * Window / T;
+			CheckRateIn(Name, Got, Sources, Window);
+		}
+
+		void CheckRateIn(const FString& Name, const int32 Got, const int32 Sources, const float Seconds)
+		{
+			const float Expected = Sources * Seconds / T;
 			const bool bOk = Got >= FMath::FloorToInt(Expected) - Sources && Got <= FMath::CeilToInt(Expected) + Sources;
-			Check(bOk, Name, FString::Printf(TEXT("uploaded %d in %.2f s, expected %.1f (%d source(s) x %.2f/s)"), Got, Window, Expected, Sources, 1.0f / T));
+			Check(bOk, Name, FString::Printf(TEXT("uploaded %d in %.2f s, expected %.1f (%d source(s) x %.2f/s)"), Got, Seconds, Expected, Sources, 1.0f / T));
+		}
+
+		// 10. Network budget: with the budget lowered to 10 items/s (burst 5), uploads from all crates together stay
+		//     within it, and throttled crates take turns.
+		void AddBudgetSteps()
+		{
+			Steps.Add([this]
+			{
+				// The earlier steps' crates are done with; left alone they would keep feeding item A into the depot and
+				// take the room the next steps measure with (in Instant mode, all of it at once).
+				for (const TWeakObjectPtr<AFGCrate>* Old : {&CrateA, &CrateB, &CrateMulti, &CrateIdle, &CrateDeath, &CrateSmall})
+				{
+					DestroyCrate(*Old);
+				}
+				const int32 StackSize = FMath::Max(1, UFGItemDescriptor::GetStackSize(ItemA));
+				MakeRoom(One(ItemA, 400 + ItemAInCrates()), 0);
+				Set(DDC::KeyRateMode, TEXT("PerSlot"));
+				Track(SpawnCrate(World.Get(), {{ItemA, 4 * StackSize}}, EFGCrateType::CT_DismantleCrate, FVector(300, -300, 100)), CrateCapA);
+				Track(SpawnCrate(World.Get(), {{ItemA, 4 * StackSize}}, EFGCrateType::CT_DismantleCrate, FVector(300, -600, 100)), CrateCapB);
+				ModSubsystem()->SetDepotBudgetOverride(10.0f, 5.0f);
+				return 1.0f;
+			});
+			Steps.Add([this]
+			{
+				ModSubsystem()->SetDepotBudgetOverride(10.0f, 5.0f); // starts a fresh burst of 5
+				TakeSnapshot(ItemA);
+				return Window;
+			});
+			Steps.Add([this]
+			{
+				const int32 Total = TotalUploadedSince();
+				const float Most = 10.0f * Window + 5.0f + 2.0f; // +2: the refill straddles the window's edges
+				const float Least = 10.0f * Window * 0.8f;
+				Check(Total <= Most && Total >= Least, TEXT("network budget caps crate uploads"),
+					FString::Printf(TEXT("uploaded %d in %.2f s with a 10/s budget (burst 5), allowed %.0f-%.0f"), Total, Window, Least, Most));
+				const int32 A = UploadedSince(CrateCapA.Get());
+				const int32 B = UploadedSince(CrateCapB.Get());
+				Check(A > 0 && B > 0 && FMath::Min(A, B) * 3 >= FMath::Max(A, B), TEXT("throttled crates take turns"), FString::Printf(TEXT("crate A %d, crate B %d"), A, B));
+				ModSubsystem()->SetDepotBudgetOverride(0.0f, 0.0f);
+				DestroyCrate(CrateCapA);
+				DestroyCrate(CrateCapB);
+				return 0.5f;
+			});
+		}
+
+		// 11. Instant: crates empty within a few ticks (the per-tick cap is 500 items); the worst tick is logged.
+		void AddInstantSteps()
+		{
+			Steps.Add([this]
+			{
+				// Three crates, sized so the depot can take everything, including item A still in other crates (the
+				// save's own), which Instant empties too.
+				const int32 InCrates = ItemAInCrates();
+				BulkItems = FMath::Min(1500, FMath::Max(0, Depot()->GetCentralStorageItemLimit(ItemA) - 100 - InCrates));
+				MakeRoom(One(ItemA, BulkItems + InCrates), 0);
+				Set(DDC::KeyRateMode, TEXT("Instant"));
+				BulkCrates.Reset();
+				for (int32 Index = 0; Index < 3; ++Index)
+				{
+					AFGCrate* Crate = SpawnCrate(World.Get(), {{ItemA, BulkItems / 3}}, EFGCrateType::CT_DismantleCrate, FVector(600 + 300 * Index, -300, 100));
+					BulkCrates.Add(Crate);
+					CratesUnderTest.Add(Crate);
+				}
+				ModSubsystem()->ResetTickStats();
+				return 2.0f;
+			});
+			Steps.Add([this]
+			{
+				int32 Left = 0;
+				for (const TWeakObjectPtr<AFGCrate>& Crate : BulkCrates)
+				{
+					Left += CountItems(Crate.Get());
+				}
+				Check(BulkItems >= 300 && Left == 0, TEXT("instant empties crates"), FString::Printf(TEXT("%d of %d left after 2 s"), Left, (BulkItems / 3) * 3));
+				Log(FString::Printf(TEXT("INFO instant: worst tick %.1f us, average %.1f us over %lld ticks"), ModSubsystem()->GetMaxTickMicroseconds(),
+					ModSubsystem()->GetAverageTickMicroseconds(), ModSubsystem()->GetTickCount()));
+				for (const TWeakObjectPtr<AFGCrate>& Crate : BulkCrates)
+				{
+					DestroyCrate(Crate);
+				}
+				BulkCrates.Reset();
+				// Back to a rate mode before the next step makes room, so nothing fills it in one go meanwhile.
+				Set(DDC::KeyRateMode, TEXT("PerCrate"));
+				return 0.5f;
+			});
+		}
+
+		// 12. Shared by all uploaders: all crates together at N uploaders' rate (N = uploaders built).
+		void AddPerUploaderSteps()
+		{
+			Steps.Add([this]
+			{
+				Uploaders = FMath::Max(1, ModSubsystem()->GetUploadersInWorld());
+				const float Rate = Uploaders / T;
+				// The measuring window plus a second of warm-up must fit in the depot's room for item A.
+				const int32 Limit = Depot()->GetCentralStorageItemLimit(ItemA);
+				UploaderWindow = FMath::Clamp(0.8f * Limit / Rate - 1.5f, 1.0f, Window);
+				// Each crate holds enough for the whole run, so neither runs dry; the depot only needs room for what all
+				// crates together (the save's own included, since they share the rate) upload in the warm-up and the window.
+				const int32 PerCrate = FMath::CeilToInt(Rate * (UploaderWindow + 1.0f)) + 20;
+				MakeRoom(One(ItemA, FMath::Min(Limit, FMath::CeilToInt(Rate * (UploaderWindow + 1.5f)) + 50)), 0);
+				Set(DDC::KeyRateMode, TEXT("PerUploader"));
+				Track(SpawnCrate(World.Get(), {{ItemA, PerCrate}}, EFGCrateType::CT_DismantleCrate, FVector(300, -900, 100)), CrateUpA);
+				Track(SpawnCrate(World.Get(), {{ItemA, PerCrate}}, EFGCrateType::CT_DismantleCrate, FVector(600, -900, 100)), CrateUpB);
+				Log(FString::Printf(TEXT("%d uploader(s): expecting %.1f items/s, window %.2f s"), Uploaders, Rate, UploaderWindow));
+				return 1.0f;
+			});
+			Steps.Add([this] { TakeSnapshot(ItemA); return UploaderWindow; });
+			Steps.Add([this]
+			{
+				CheckRateIn(FString::Printf(TEXT("shared by all uploaders (%d)"), Uploaders), TotalUploadedSince(), Uploaders, UploaderWindow);
+				DestroyCrate(CrateUpA);
+				DestroyCrate(CrateUpB);
+				Set(DDC::KeyRateMode, TEXT("PerCrate"));
+				return 0.5f;
+			});
+		}
+
+		// 13. Sinking: items the depot is full of go from dismantle crates to the AWESOME Sink; death crates never.
+		void AddSinkSteps()
+		{
+			Steps.Add([this]
+			{
+				Set(DDC::KeySinkWhenDepotFull, TEXT("true"));
+				Set(DDC::KeyIncludeDeathCrates, TEXT("true"));
+				bDeathCratesOn = true;
+				return 1.5f; // the debounce, then the sink count (refreshed at most once a second)
+			});
+			Steps.Add([this]
+			{
+				ItemSinkFull = FindSinkableFullItem();
+				bSinkReady = ModSubsystem()->GetSinksInWorld() > 0 && ItemSinkFull;
+				if (!bSinkReady)
+				{
+					Skip(TEXT("sink what the depot is full of"), FString::Printf(TEXT("%d sink(s) built, sinkable full item %s"), ModSubsystem()->GetSinksInWorld(),
+						ItemSinkFull ? *ItemSinkFull->GetName() : TEXT("none")));
+					return 0.1f;
+				}
+				Track(SpawnCrate(World.Get(), {{ItemSinkFull, 10}}, EFGCrateType::CT_DismantleCrate, FVector(900, -300, 100)), CrateSink);
+				Track(SpawnCrate(World.Get(), {{ItemSinkFull, 10}}, EFGCrateType::CT_DeathCrate, FVector(900, -600, 100)), CrateSinkDeath);
+				SunkBefore = ModSubsystem()->GetItemsSunk();
+				return 10.0f * T + 2.0f;
+			});
+			Steps.Add([this]
+			{
+				if (bSinkReady)
+				{
+					const int64 Sunk = ModSubsystem()->GetItemsSunk() - SunkBefore;
+					Check(CountItems(CrateSink.Get()) == 0 && Sunk >= 10, TEXT("sink what the depot is full of"),
+						FString::Printf(TEXT("%s: %d of 10 left in the crate, %lld sunk (the save's own crates may add more), depot %d/%d"), *ItemSinkFull->GetName(),
+							CountItems(CrateSink.Get()), Sunk, Depot()->GetNumItemsFromCentralStorage(ItemSinkFull), Depot()->GetCentralStorageItemLimit(ItemSinkFull)));
+					Check(CountItems(CrateSinkDeath.Get()) == 10, TEXT("death crates are never sunk"), FString::Printf(TEXT("%d of 10 left"), CountItems(CrateSinkDeath.Get())));
+				}
+				Set(DDC::KeySinkWhenDepotFull, TEXT("false"));
+				Set(DDC::KeyIncludeDeathCrates, TEXT("false"));
+				bDeathCratesOn = false;
+				DestroyCrate(CrateSinkDeath);
+				return 0.5f;
+			});
+		}
+
+		// 14. Stuck-crate notices: an item the depot is full of is announced once; equipment a death crate keeps is not
+		//     stuck; an item with room is forgotten, and stuck again within 5 minutes it is not announced again.
+		void AddNoticeSteps()
+		{
+			Steps.Add([this]
+			{
+				bNoticeReady = ItemFull != nullptr;
+				if (!bNoticeReady)
+				{
+					Skip(TEXT("stuck-crate notices"), TEXT("no item in this depot is at its limit"));
+					return 0.1f;
+				}
+				// Counted from here: the regular 5 s scan may send the first notice before the test's own scan does.
+				NoticesBefore = ModSubsystem()->GetNoticesSent();
+				Set(DDC::KeyShowStuckNotices, TEXT("true"));
+				Set(DDC::KeyIncludeDeathCrates, TEXT("true"));
+				bDeathCratesOn = true;
+				Track(SpawnCrate(World.Get(), {{ItemFull, 7}}, EFGCrateType::CT_DismantleCrate, FVector(1200, -300, 100)), CrateNotice);
+				if (Equipment)
+				{
+					Track(SpawnCrate(World.Get(), {{Equipment, 1}}, EFGCrateType::CT_DeathCrate, FVector(1200, -600, 100)), CrateNoticeDeath);
+				}
+				return 1.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!bNoticeReady)
+				{
+					return 0.1f;
+				}
+				ADimensionalDismantleCrateSubsystem* Subsystem = ModSubsystem();
+				Subsystem->RunNoticeScanNow();
+				const FString Name = UFGItemDescriptor::GetItemName(ItemFull).ToString();
+				Check(Subsystem->IsBlockedForNotice(ItemFull) && Subsystem->GetNoticesSent() == NoticesBefore + 1 && Subsystem->GetLastNotice().Contains(Name),
+					TEXT("notice names an item the depot is full of"), FString::Printf(TEXT("%d new notice(s): \"%s\""), Subsystem->GetNoticesSent() - NoticesBefore, *Subsystem->GetLastNotice()));
+				if (Equipment)
+				{
+					Check(!Subsystem->IsBlockedForNotice(Equipment), TEXT("equipment a death crate keeps is not stuck"), *Equipment->GetName());
+				}
+				Track(SpawnCrate(World.Get(), {{ItemFull, 3}}, EFGCrateType::CT_DismantleCrate, FVector(1200, -900, 100)), CrateNotice2);
+				return 1.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!bNoticeReady)
+				{
+					return 0.1f;
+				}
+				ADimensionalDismantleCrateSubsystem* Subsystem = ModSubsystem();
+				NoticesBefore = Subsystem->GetNoticesSent();
+				Subsystem->RunNoticeScanNow();
+				Check(Subsystem->GetNoticesSent() == NoticesBefore, TEXT("a stuck item is announced once"), FString::Printf(TEXT("%d new notice(s)"), Subsystem->GetNoticesSent() - NoticesBefore));
+				// Room for five: the item can upload again, so it is no longer stuck. The crates hold ten, so the depot
+				// fills up again and the rest gets stuck again shortly after.
+				FreedRoom = Depot()->TryRemoveItemsFromCentralStorage(ItemFull, 5);
+				Subsystem->RunNoticeScanNow();
+				Check(FreedRoom > 0 && !Subsystem->IsBlockedForNotice(ItemFull), TEXT("an item with room is not stuck"), FString::Printf(TEXT("freed %d"), FreedRoom));
+				return 5.0f * T + DDC::FUploadTimer::IdleRecheckSeconds + 1.5f;
+			});
+			Steps.Add([this]
+			{
+				if (!bNoticeReady)
+				{
+					return 0.1f;
+				}
+				ADimensionalDismantleCrateSubsystem* Subsystem = ModSubsystem();
+				NoticesBefore = Subsystem->GetNoticesSent();
+				Subsystem->RunNoticeScanNow();
+				Check(Subsystem->IsBlockedForNotice(ItemFull) && Subsystem->GetNoticesSent() == NoticesBefore, TEXT("stuck again within 5 minutes: no new notice"),
+					FString::Printf(TEXT("stuck %s, %d new notice(s), depot %d/%d"), Subsystem->IsBlockedForNotice(ItemFull) ? TEXT("yes") : TEXT("no"),
+						Subsystem->GetNoticesSent() - NoticesBefore, Depot()->GetNumItemsFromCentralStorage(ItemFull), Depot()->GetCentralStorageItemLimit(ItemFull)));
+
+				// The gate notice: research done but no uploader built (pretended), and crates hold items. The 30 s gap
+				// after the notice above is lifted so it can go out now.
+				Subsystem->SetUploaderCountOverride(0);
+				Subsystem->ResetNoticeGapForTest();
+				NoticesBefore = Subsystem->GetNoticesSent();
+				Subsystem->RunNoticeScanNow();
+				const int32 GateNotices = Subsystem->GetNoticesSent() - NoticesBefore;
+				const FString GateText = Subsystem->GetLastNotice();
+				Subsystem->ResetNoticeGapForTest();
+				Subsystem->RunNoticeScanNow();
+				const int32 GateRepeats = Subsystem->GetNoticesSent() - NoticesBefore - GateNotices;
+				Subsystem->SetUploaderCountOverride(-1);
+				Check(GateNotices == 1 && GateRepeats == 0 && GateText.Contains(TEXT("once a Dimensional Depot Uploader is built")), TEXT("no uploader built: one notice says so"),
+					FString::Printf(TEXT("%d notice(s), then %d repeat(s): \"%s\""), GateNotices, GateRepeats, *GateText));
+				Set(DDC::KeyShowStuckNotices, TEXT("false"));
+				Set(DDC::KeyIncludeDeathCrates, TEXT("false"));
+				bDeathCratesOn = false;
+				DestroyCrate(CrateNotice);
+				DestroyCrate(CrateNotice2);
+				DestroyCrate(CrateNoticeDeath);
+				return 0.5f;
+			});
+		}
+
+		// 9h-9j. Depot-first refunds, through the game's own server dismantle with room in the inventory.
+		void AddDepotFirstSteps()
+		{
+			// 9h. Switch on, the player's own "take from inventory before depot" off: the refund goes to the depot first.
+			Steps.Add([this]
+			{
+				AFGPlayerState* State = PlayerState();
+				bDepotFirstReady = bOverflowReady && State;
+				if (!bDepotFirstReady)
+				{
+					if (bOverflowReady)
+					{
+						Skip(TEXT("depot-first refunds"), TEXT("no player state"));
+					}
+					return 0.1f;
+				}
+				bPreferenceBackup = State->GetTakeFromInventoryBeforeCentralStorage();
+				Log(FString::Printf(TEXT("INFO the player's 'take from inventory before depot' was %s before the test"), bPreferenceBackup ? TEXT("on") : TEXT("off")));
+				State->SetTakeFromInventoryBeforeCentralStorage(false);
+				Set(DDC::KeyOverflowToDepot, TEXT("false"));
+				Set(DDC::KeyRefundsFollowDepotPreference, TEXT("true"));
+				Player->GetInventory()->Empty();
+				return 1.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!bDepotFirstReady)
+				{
+					return 0.1f;
+				}
+				MakeRoom(BatchRefund, 200);
+				ExpectedSent = DepotShare(BatchRefund);
+				ExpectedTotal = Sum(BatchRefund);
+				BeginMeasure();
+				DismantleLightweightBatch();
+				return 1.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!bDepotFirstReady)
+				{
+					return 0.1f;
+				}
+				const int32 Refunded = static_cast<int32>(ModSubsystem()->GetItemsRefundedToDepot() - RefundedBefore);
+				const int32 Inventory = Sum(Diff(InventoryItems(), InventoryBefore));
+				const int32 Crated = Sum(Diff(CrateItems(), CrateItemsBefore));
+				const int32 Dismantles = DDC::RefundHook::GetDepotFirstDismantles() - DepotFirstBefore;
+				Check(Dismantles == 1 && Refunded > 0 && Refunded == ExpectedSent && Refunded + Inventory == ExpectedTotal && Crated == 0, TEXT("refund goes to the depot first"),
+					FString::Printf(TEXT("%d depot-first dismantle(s), depot +%d (expected %d), inventory +%d, crates +%d, refund %d; hook saw %d dismantle(s) in all, last refusal: %s"),
+						Dismantles, Refunded, ExpectedSent, Inventory, Crated, ExpectedTotal, DDC::RefundHook::GetDismantleHookCalls(),
+						DDC::RefundHook::GetLastDepotFirstRefusal().IsEmpty() ? TEXT("none") : *DDC::RefundHook::GetLastDepotFirstRefusal()));
+				PlayerState()->SetTakeFromInventoryBeforeCentralStorage(true);
+				Player->GetInventory()->Empty();
+				return 0.5f;
+			});
+
+			// 9i. The player's own setting on: the inventory first, as in the base game.
+			Steps.Add([this]
+			{
+				if (!bDepotFirstReady)
+				{
+					return 0.1f;
+				}
+				MakeRoom(BatchRefund, 200);
+				ExpectedTotal = Sum(BatchRefund);
+				BeginMeasure();
+				DismantleLightweightBatch();
+				return 1.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!bDepotFirstReady)
+				{
+					return 0.1f;
+				}
+				const int32 Refunded = static_cast<int32>(ModSubsystem()->GetItemsRefundedToDepot() - RefundedBefore);
+				const int32 Inventory = Sum(Diff(InventoryItems(), InventoryBefore));
+				// The refusal reason proves the player's setting was read, not that the scope failed for another reason.
+				const FString& Why = DDC::RefundHook::GetLastDepotFirstRefusal();
+				Check(Refunded == 0 && Inventory == ExpectedTotal && Why.Contains(TEXT("takes from the inventory")), TEXT("player who takes from the inventory first: refund to the inventory"),
+					FString::Printf(TEXT("depot +%d, inventory +%d, refund %d, refusal: %s"), Refunded, Inventory, ExpectedTotal, Why.IsEmpty() ? TEXT("none") : *Why));
+				PlayerState()->SetTakeFromInventoryBeforeCentralStorage(false);
+				Set(DDC::KeyRefundsFollowDepotPreference, TEXT("false"));
+				Player->GetInventory()->Empty();
+				return 1.0f;
+			});
+
+			// 9j. The switch off (the default): the inventory first for everyone, whatever their own setting.
+			Steps.Add([this]
+			{
+				if (!bDepotFirstReady)
+				{
+					return 0.1f;
+				}
+				ExpectedTotal = Sum(BatchRefund);
+				BeginMeasure();
+				DismantleLightweightBatch();
+				return 1.0f;
+			});
+			Steps.Add([this]
+			{
+				if (!bDepotFirstReady)
+				{
+					return 0.1f;
+				}
+				const int32 Refunded = static_cast<int32>(ModSubsystem()->GetItemsRefundedToDepot() - RefundedBefore);
+				const int32 Inventory = Sum(Diff(InventoryItems(), InventoryBefore));
+				const int32 Dismantles = DDC::RefundHook::GetDepotFirstDismantles() - DepotFirstBefore;
+				const FString& Why = DDC::RefundHook::GetLastDepotFirstRefusal();
+				Check(Refunded == 0 && Dismantles == 0 && Inventory == ExpectedTotal && Why.Contains(TEXT("option is off")), TEXT("switch off: refund to the inventory as in the base game"),
+					FString::Printf(TEXT("depot +%d, depot-first dismantles %d, inventory +%d, refund %d, refusal: %s"), Refunded, Dismantles, Inventory, ExpectedTotal, Why.IsEmpty() ? TEXT("none") : *Why));
+				PlayerState()->SetTakeFromInventoryBeforeCentralStorage(bPreferenceBackup);
+				return 0.1f;
+			});
+		}
+
+		/** Nanoseconds per AddStack call into a full one-slot inventory (the cheapest real call), best of Rounds. */
+		static double TimeAddStack(UFGInventoryComponent* Inventory, const TSubclassOf<UFGItemDescriptor> Item, const int32 Calls, const int32 Rounds)
+		{
+			const FInventoryStack One(1, Item);
+			double Best = TNumericLimits<double>::Max();
+			int64 Sink = 0;
+			for (int32 Round = 0; Round < Rounds; ++Round)
+			{
+				const double Start = FPlatformTime::Seconds();
+				for (int32 Call = 0; Call < Calls; ++Call)
+				{
+					Sink += Inventory->AddStack(One, true); // virtual, so it goes through the detour like the game's calls
+				}
+				Best = FMath::Min(Best, (FPlatformTime::Seconds() - Start) * 1e9 / Calls);
+			}
+			if (Sink != 0)
+			{
+				Log(FString::Printf(TEXT("INFO hook cost: %lld item(s) were added to the full inventory (unexpected)"), Sink));
+			}
+			return Best;
+		}
+
+		// 15 (0.3.0). What the AddStack hook costs. It runs on every AddStack in the game, so this times AddStack with
+		//     the hook, without it (SML removes the detour with the last handler), and with it again, on the game thread
+		//     between frames. Then it counts the game's own AddStack calls for 10 s to turn the per-call cost into a
+		//     per-second cost for this save.
+		double HookCostWith1 = 0.0, HookCostWithout = 0.0, HookCostWith2 = 0.0;
+		int64 AddStackCallsBefore = 0;
+		double AddStackCountStart = 0.0;
+
+		void AddHookCostSteps()
+		{
+			Steps.Add([this]
+			{
+				if (!DDC::RefundHook::IsAddStackHookInstalled() || !ItemA)
+				{
+					Skip(TEXT("AddStack hook cost"), TEXT("the hook isn't installed or there is no test item"));
+					return 0.1f;
+				}
+				UFGInventoryComponent* Bench = NewObject<UFGInventoryComponent>(ModSubsystem(), NAME_None, RF_Transient);
+				Bench->RegisterComponent();
+				Bench->Resize(1);
+				Bench->AddStack(FInventoryStack(FMath::Max(1, UFGItemDescriptor::GetStackSize(ItemA)), ItemA), true);
+				constexpr int32 Calls = 200000;
+				constexpr int32 Rounds = 3;
+				HookCostWith1 = TimeAddStack(Bench, ItemA, Calls, Rounds);
+				const bool bOff = DDC::RefundHook::SetAddStackHookForCostTest(false) && !DDC::RefundHook::IsAddStackHookInstalled();
+				HookCostWithout = TimeAddStack(Bench, ItemA, Calls, Rounds);
+				const bool bOn = DDC::RefundHook::SetAddStackHookForCostTest(true) && DDC::RefundHook::IsAddStackHookInstalled();
+				HookCostWith2 = TimeAddStack(Bench, ItemA, Calls, Rounds);
+				Bench->Empty();
+				Bench->DestroyComponent();
+				Check(bOff && bOn, TEXT("AddStack hook off and back on for the cost test"), FString::Printf(TEXT("off %s, back on %s"),
+					bOff ? TEXT("ok") : TEXT("failed"), bOn ? TEXT("ok") : TEXT("failed")));
+				Log(FString::Printf(TEXT("INFO hook cost: AddStack into a full inventory %.1f ns with the hook, %.1f ns without, %.1f ns with it again (best of %d x %d calls)"),
+					HookCostWith1, HookCostWithout, HookCostWith2, Rounds, Calls));
+				DDC::RefundHook::SetCountAddStackCalls(true);
+				AddStackCallsBefore = DDC::RefundHook::GetAddStackCalls();
+				AddStackCountStart = FPlatformTime::Seconds();
+				return 10.0f;
+			});
+			Steps.Add([this]
+			{
+				if (AddStackCountStart <= 0.0)
+				{
+					return 0.1f;
+				}
+				DDC::RefundHook::SetCountAddStackCalls(false);
+				const double Seconds = FPlatformTime::Seconds() - AddStackCountStart;
+				const double PerSecond = (DDC::RefundHook::GetAddStackCalls() - AddStackCallsBefore) / FMath::Max(Seconds, 0.001);
+				const double OverheadNs = FMath::Max(0.0, FMath::Min(HookCostWith1, HookCostWith2) - HookCostWithout);
+				// Microseconds of hook overhead per second of play, summed over all threads.
+				const double MicrosPerSecond = PerSecond * OverheadNs / 1000.0;
+				Log(FString::Printf(TEXT("INFO hook cost: the game called AddStack %.0f times/s here over %.1f s; overhead %.1f ns/call = %.1f us per second of play (all threads)"),
+					PerSecond, Seconds, OverheadNs, MicrosPerSecond));
+				return 0.1f;
+			});
 		}
 
 		void Track(AFGCrate* Crate, TWeakObjectPtr<AFGCrate>& Slot)
@@ -582,6 +1107,9 @@ namespace
 				Set(DDC::KeyRateMode, TEXT("PerCrate"));
 				Set(DDC::KeyIncludeDeathCrates, TEXT("false"));
 				Set(DDC::KeyUploadDeathCrateEquipment, TEXT("false"));
+				Set(DDC::KeyShowStuckNotices, TEXT("false"));
+				Set(DDC::KeySinkWhenDepotFull, TEXT("false"));
+				Set(DDC::KeyRefundsFollowDepotPreference, TEXT("false"));
 				return 1.0f;
 			});
 
@@ -780,6 +1308,13 @@ namespace
 				return 0.5f;
 			});
 
+			// 10-14 (0.3.0): network budget, Instant, shared by all uploaders, sinking, stuck-crate notices.
+			AddBudgetSteps();
+			AddInstantSteps();
+			AddPerUploaderSteps();
+			AddSinkSteps();
+			AddNoticeSteps();
+
 			// 9. Dismantle overflow straight to the depot. Real dismantles through the game's server code, with the
 			//    player's inventory filled so the refund overflows. Crate uploading is off meanwhile, so crates only change
 			//    through dismantling and the overflow option. Lightweight buildables (foundations and the like) and
@@ -973,7 +1508,7 @@ namespace
 				{
 					return 0.1f;
 				}
-				ModSubsystem()->SetOverflowBudgetOverride(20.0f, 5.0f);
+				ModSubsystem()->SetDepotBudgetOverride(20.0f, 5.0f);
 				// Extra room: the save's own uploaders may feed the same item while the crate drains over a few seconds.
 				MakeRoom(BatchRefund, 1000);
 				ExpectedSent = DepotShare(BatchRefund);
@@ -1004,7 +1539,7 @@ namespace
 				Check(Sent > 0 && Sent == ExpectedSent && Sent + Crated == ExpectedTotal && ModSubsystem()->GetOverflowOwedItems() == 0, TEXT("crate overflow sent at the overflow rate"),
 					FString::Printf(TEXT("sent %d (expected %d), crates +%d, refund %d, still waiting %d"), Sent, ExpectedSent, Crated, ExpectedTotal,
 						ModSubsystem()->GetOverflowOwedItems()));
-				ModSubsystem()->SetOverflowBudgetOverride(0.0f, 0.0f);
+				ModSubsystem()->SetDepotBudgetOverride(0.0f, 0.0f);
 				return 0.1f;
 			});
 
@@ -1019,6 +1554,7 @@ namespace
 					}
 					return 0.1f;
 				}
+				MakeRoom(One(ItemA, 20), 0); // the earlier rate steps may have filled the depot with item A
 				BeginMeasure();
 				const TArray<FInventoryStack> Refund{FInventoryStack(10, ItemFull), FInventoryStack(20, ItemA)};
 				FDismantleHelpers::DropRefundOnGroundNoActor(World.Get(), Player->GetActorLocation() + FVector(300, -300, 100), nullptr, Refund, Player.Get());
@@ -1035,6 +1571,9 @@ namespace
 					FString::Printf(TEXT("sent %d (expected 20), crates +%s"), SentSinceMeasure(), *Describe(Crated)));
 				return 0.1f;
 			});
+
+			// 9h-9j (0.3.0): depot-first refunds.
+			AddDepotFirstSteps();
 
 			// 9g. Clean up: the player's inventory back, the option off, crate uploading on.
 			Steps.Add([this]
@@ -1094,10 +1633,16 @@ namespace
 				return 0.1f;
 			});
 
+			// 15 (0.3.0): the AddStack hook's cost.
+			AddHookCostSteps();
+
 			// Summary (always the last step).
 			Steps.Add([this]
 			{
 				Set(DDC::KeyRateMode, TEXT("PerCrate"));
+				Set(DDC::KeyShowStuckNotices, TEXT("false"));
+				Set(DDC::KeySinkWhenDepotFull, TEXT("false"));
+				Set(DDC::KeyRefundsFollowDepotPreference, TEXT("false"));
 				ClearCrates();
 				if (ADimensionalDismantleCrateSubsystem* Subsystem = ADimensionalDismantleCrateSubsystem::Get(World.Get()))
 				{
@@ -1167,6 +1712,34 @@ namespace DDC::Dev
 					Details += FString::Printf(TEXT(" %s=%d"), *It->GetName(), Count);
 				}
 				UE_LOG(LogDimensionalDismantleCrate, Display, TEXT("[DDCClient] %d crate(s), %d item(s):%s"), Crates, Items, *Details.Left(1500));
+
+				// Chat messages this client has received (the list the game's chat window shows), so the test can
+				// confirm the mod's notices reach players. New ones are told apart by the server's time stamp, since
+				// the list may drop old entries.
+				static TWeakObjectPtr<UWorld> ChatWorld;
+				static float LastChatStamp = -1.0f;
+				if (ChatWorld.Get() != World)
+				{
+					ChatWorld = World;
+					LastChatStamp = -1.0f;
+				}
+				if (AFGChatManager* Chat = AFGChatManager::Get(World))
+				{
+					TArray<FChatMessageStruct> Received;
+					Chat->GetReceivedChatMessages(Received);
+					for (const FChatMessageStruct& Message : Received)
+					{
+						if (Message.ServerTimeStamp > LastChatStamp)
+						{
+							UE_LOG(LogDimensionalDismantleCrate, Display, TEXT("[DDCClient] chat (type %d, t=%.1f): %s"),
+								static_cast<int32>(Message.MessageType), Message.ServerTimeStamp, *Message.MessageText.ToString().Left(400));
+						}
+					}
+					for (const FChatMessageStruct& Message : Received)
+					{
+						LastChatStamp = FMath::Max(LastChatStamp, Message.ServerTimeStamp);
+					}
+				}
 			}
 			return true;
 		}), 5.0f);

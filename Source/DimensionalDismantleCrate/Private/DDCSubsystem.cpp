@@ -12,17 +12,24 @@
 #endif
 #include "Engine/NetDriver.h"
 #include "Engine/World.h"
+#include "GameFramework/PlayerController.h"
 #include "EngineUtils.h"
+#include "Buildables/FGBuildableResourceSink.h"
 #include "Buildables/FGCentralStorageContainer.h"
 #include "FGCentralStorageSubsystem.h"
+#include "FGChatManager.h"
 #include "FGCrate.h"
 #include "FGInventoryComponent.h"
+#include "FGPlayerState.h"
+#include "FGResourceSinkSubsystem.h"
 #include "FGSchematic.h"
 #include "FGSchematicManager.h"
 #include "Resources/FGEquipmentDescriptor.h"
 #include "Resources/FGItemDescriptor.h"
 #include "Subsystem/SubsystemActorManager.h"
 #include "TimerManager.h"
+
+using DDC::EMoveResult;
 
 namespace
 {
@@ -31,6 +38,9 @@ namespace
 
 	/** Safety net next to the spawn handler: finds crates that appeared without a spawn event (for example during load). */
 	constexpr float RescanIntervalSeconds = 10.0f;
+
+	/** Most items named in one notice line; the rest are summed up as "and N more". */
+	constexpr int32 MaxItemsNamedPerNotice = 5;
 
 	const TCHAR* NetModeName(const UWorld* World)
 	{
@@ -58,6 +68,8 @@ namespace
 		}
 	}
 
+	const TCHAR* OnOff(const bool bValue) { return bValue ? TEXT("true") : TEXT("false"); }
+
 	UConfigProperty* FindProperty(UConfigPropertySection* Section, const FString& Key, FString* OutCanonicalKey = nullptr)
 	{
 		if (!Section)
@@ -76,6 +88,12 @@ namespace
 			}
 		}
 		return nullptr;
+	}
+
+	bool ReadBool(UConfigPropertySection* Root, const TCHAR* Key, const bool bDefault)
+	{
+		const UConfigPropertyBool* Property = Cast<UConfigPropertyBool>(FindProperty(Root, Key));
+		return Property ? Property->Value : bDefault;
 	}
 
 	/** Accepts true/false, on/off, yes/no and 1/0. */
@@ -100,7 +118,7 @@ namespace
 		return false;
 	}
 
-	/** Accepts 0/1/2 or the mode names (percrate, shared, perslot). */
+	/** Accepts 0-4 or the mode names (percrate, shared, perslot, instant, peruploader). */
 	bool ParseRateMode(const FString& Text, int32& OutValue)
 	{
 		if (Text.IsNumeric())
@@ -114,14 +132,44 @@ namespace
 			return false;
 		}
 		const FString Compact = Text.Replace(TEXT(" "), TEXT("")).Replace(TEXT("_"), TEXT("")).Replace(TEXT("-"), TEXT(""));
-		if (Compact.Equals(TEXT("PerCrate"), ESearchCase::IgnoreCase)) { OutValue = static_cast<int32>(DDC::ERateMode::PerCrate); return true; }
-		if (Compact.Equals(TEXT("Shared"), ESearchCase::IgnoreCase)) { OutValue = static_cast<int32>(DDC::ERateMode::Shared); return true; }
-		if (Compact.Equals(TEXT("PerSlot"), ESearchCase::IgnoreCase) || Compact.Equals(TEXT("PerStackSlot"), ESearchCase::IgnoreCase))
+		struct FModeName { const TCHAR* Text; DDC::ERateMode Mode; };
+		for (const FModeName& Name : {
+			FModeName{TEXT("PerCrate"), DDC::ERateMode::PerCrate},
+			FModeName{TEXT("Shared"), DDC::ERateMode::Shared},
+			FModeName{TEXT("PerSlot"), DDC::ERateMode::PerSlot},
+			FModeName{TEXT("PerStackSlot"), DDC::ERateMode::PerSlot},
+			FModeName{TEXT("Instant"), DDC::ERateMode::Instant},
+			FModeName{TEXT("PerUploader"), DDC::ERateMode::PerUploader},
+			FModeName{TEXT("Uploaders"), DDC::ERateMode::PerUploader},
+			FModeName{TEXT("SharedByAllUploaders"), DDC::ERateMode::PerUploader}})
 		{
-			OutValue = static_cast<int32>(DDC::ERateMode::PerSlot);
-			return true;
+			if (Compact.Equals(Name.Text, ESearchCase::IgnoreCase))
+			{
+				OutValue = static_cast<int32>(Name.Mode);
+				return true;
+			}
 		}
 		return false;
+	}
+
+	/** "A (1), B (2) and C (3)", naming at most MaxItemsNamedPerNotice items. */
+	FString JoinItems(const TArray<FString>& Items)
+	{
+		const int32 Named = FMath::Min(Items.Num(), MaxItemsNamedPerNotice);
+		FString Text;
+		for (int32 Index = 0; Index < Named; ++Index)
+		{
+			if (Index > 0)
+			{
+				Text += (Index == Named - 1 && Named == Items.Num()) ? TEXT(" and ") : TEXT(", ");
+			}
+			Text += Items[Index];
+		}
+		if (Items.Num() > Named)
+		{
+			Text += FString::Printf(TEXT(" and %d more"), Items.Num() - Named);
+		}
+		return Text;
 	}
 }
 
@@ -196,6 +244,8 @@ void ADimensionalDismantleCrateSubsystem::BeginPlay()
 	}
 	SetActorTickEnabled(true);
 	GetWorldTimerManager().SetTimer(RescanTimer, this, &ADimensionalDismantleCrateSubsystem::Rescan, RescanIntervalSeconds, true);
+	// Returns straight away while notices are off.
+	GetWorldTimerManager().SetTimer(NoticeTimer, this, &ADimensionalDismantleCrateSubsystem::ScanForNotices, DDC::StuckScanSeconds, true);
 #if DDC_DEV_COMMANDS
 	DDC::Dev::MaybeStartAutoTest(GetWorld());
 #endif
@@ -221,6 +271,9 @@ void ADimensionalDismantleCrateSubsystem::EndPlay(const EEndPlayReason::Type End
 	TrackedKeys.Reset();
 	PendingCrates.Reset();
 	OverflowOwed.Reset();
+	BlockedItems.Reset();
+	PendingNotices.Reset();
+	TickSinkSubsystem = nullptr;
 	Super::EndPlay(EndPlayReason);
 }
 
@@ -285,9 +338,16 @@ void ADimensionalDismantleCrateSubsystem::PruneInvalidCrates()
 		TrackedKeys.Remove(Entry.Key);
 		return true;
 	});
-	if (Crates.Num() != Before && SharedCursor >= Crates.Num())
+	if (Crates.Num() != Before)
 	{
-		SharedCursor = 0;
+		if (SharedCursor >= Crates.Num())
+		{
+			SharedCursor = 0;
+		}
+		if (RotationCursor >= Crates.Num())
+		{
+			RotationCursor = 0;
+		}
 	}
 }
 
@@ -313,6 +373,7 @@ int32 ADimensionalDismantleCrateSubsystem::CountUploadersInWorld() const
 	int32 Count = 0;
 	if (UWorld* World = GetWorld())
 	{
+		// Includes subclasses, such as Dimensional Sinking Depot's buildings, which upload too.
 		for (TActorIterator<AFGCentralStorageContainer> It(World); It; ++It)
 		{
 			if (IsValid(*It) && !It->IsActorBeingDestroyed())
@@ -324,20 +385,44 @@ int32 ADimensionalDismantleCrateSubsystem::CountUploadersInWorld() const
 	return Count;
 }
 
-bool ADimensionalDismantleCrateSubsystem::IsGateOpen()
+int32 ADimensionalDismantleCrateSubsystem::CountSinksInWorld() const
+{
+	int32 Count = 0;
+	if (UWorld* World = GetWorld())
+	{
+		for (TActorIterator<AFGBuildableResourceSink> It(World); It; ++It)
+		{
+			if (IsValid(*It) && !It->IsActorBeingDestroyed())
+			{
+				++Count;
+			}
+		}
+	}
+	return Count;
+}
+
+void ADimensionalDismantleCrateSubsystem::RefreshBuildingCounts()
 {
 	// Uploaders are counted in the world: AFGCentralStorageSubsystem::IsCentralStorageBuilt() returned false in a
 	// loaded save with 16 uploaders (its registration list stayed empty), so the game's own list can't be trusted here.
 	const double Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
-	if (Now - LastUploaderCountSeconds >= 1.0 || LastUploaderCountSeconds < 0.0)
+	if (LastBuildingCountSeconds >= 0.0 && Now - LastBuildingCountSeconds < 1.0)
 	{
-		LastUploaderCountSeconds = Now;
-		UploadersInWorld = CountUploadersInWorld();
+		return;
 	}
-	if (UploadersInWorld == 0)
+	LastBuildingCountSeconds = Now;
+	UploadersInWorld = CountUploadersInWorld();
+#if DDC_DEV_COMMANDS
+	if (DevUploadersOverride >= 0)
 	{
-		return false;
+		UploadersInWorld = DevUploadersOverride;
 	}
+#endif
+	SinksInWorld = bSinkWhenDepotFull ? CountSinksInWorld() : 0;
+}
+
+bool ADimensionalDismantleCrateSubsystem::IsResearchDone()
+{
 	if (!bResearchDone)
 	{
 		// Research can't be undone in normal play, so it is only looked up until it is found.
@@ -347,64 +432,74 @@ bool ADimensionalDismantleCrateSubsystem::IsGateOpen()
 	return bResearchDone;
 }
 
+bool ADimensionalDismantleCrateSubsystem::IsGateOpen()
+{
+	RefreshBuildingCounts();
+	return UploadersInWorld > 0 && IsResearchDone();
+}
+
 void ADimensionalDismantleCrateSubsystem::ReadConfig()
 {
 	const bool bOldEnabled = bEnabled;
 	const DDC::ERateMode OldMode = RateMode;
 	const bool bOldDeath = bIncludeDeathCrates;
 	const bool bOldDeathEquipment = bUploadDeathCrateEquipment;
+	const bool bOldSink = bSinkWhenDepotFull;
 
-	bEnabled = true;
 	RateMode = DDC::ERateMode::PerCrate;
-	bIncludeDeathCrates = false;
-	bUploadDeathCrateEquipment = false;
-	bOverflowToDepot = false;
-
 	UConfigPropertySection* Root = GetConfigRootSection(GetWorld());
 	if (!Root)
 	{
 		UE_LOG(LogDimensionalDismantleCrate, Warning, TEXT("Configuration '%s' is not registered; using the defaults"), DDC::ModReference);
 	}
-	else
+	else if (const UConfigPropertyInteger* Mode = Cast<UConfigPropertyInteger>(FindProperty(Root, DDC::KeyRateMode)))
 	{
-		if (const UConfigPropertyBool* Enabled = Cast<UConfigPropertyBool>(FindProperty(Root, DDC::KeyEnabled)))
+		if (Mode->Value >= DDC::RateModeMin && Mode->Value <= DDC::RateModeMax)
 		{
-			bEnabled = Enabled->Value;
+			RateMode = static_cast<DDC::ERateMode>(Mode->Value);
 		}
-		if (const UConfigPropertyInteger* Mode = Cast<UConfigPropertyInteger>(FindProperty(Root, DDC::KeyRateMode)))
+		else
 		{
-			if (Mode->Value >= DDC::RateModeMin && Mode->Value <= DDC::RateModeMax)
-			{
-				RateMode = static_cast<DDC::ERateMode>(Mode->Value);
-			}
-			else
-			{
-				UE_LOG(LogDimensionalDismantleCrate, Warning, TEXT("%s = %d is not %d-%d; using %d (%s)"), DDC::KeyRateMode, Mode->Value,
-					DDC::RateModeMin, DDC::RateModeMax, static_cast<int32>(RateMode), DDC::RateModeName(RateMode));
-			}
-		}
-		if (const UConfigPropertyBool* Death = Cast<UConfigPropertyBool>(FindProperty(Root, DDC::KeyIncludeDeathCrates)))
-		{
-			bIncludeDeathCrates = Death->Value;
-		}
-		if (const UConfigPropertyBool* Equipment = Cast<UConfigPropertyBool>(FindProperty(Root, DDC::KeyUploadDeathCrateEquipment)))
-		{
-			bUploadDeathCrateEquipment = Equipment->Value;
-		}
-		if (const UConfigPropertyBool* Overflow = Cast<UConfigPropertyBool>(FindProperty(Root, DDC::KeyOverflowToDepot)))
-		{
-			bOverflowToDepot = Overflow->Value;
+			UE_LOG(LogDimensionalDismantleCrate, Warning, TEXT("%s = %d is not %d-%d; using %d (%s)"), DDC::KeyRateMode, Mode->Value,
+				DDC::RateModeMin, DDC::RateModeMax, static_cast<int32>(RateMode), DDC::RateModeName(RateMode));
 		}
 	}
+	// ReadBool returns the default when the configuration (or the key) is missing.
+	bEnabled = ReadBool(Root, DDC::KeyEnabled, true);
+	bIncludeDeathCrates = ReadBool(Root, DDC::KeyIncludeDeathCrates, false);
+	bUploadDeathCrateEquipment = ReadBool(Root, DDC::KeyUploadDeathCrateEquipment, false);
+	bOverflowToDepot = ReadBool(Root, DDC::KeyOverflowToDepot, false);
+	bShowStuckNotices = ReadBool(Root, DDC::KeyShowStuckNotices, false);
+	bSinkWhenDepotFull = ReadBool(Root, DDC::KeySinkWhenDepotFull, false);
+	bRefundsFollowDepotPreference = ReadBool(Root, DDC::KeyRefundsFollowDepotPreference, false);
+
 	if (!bOverflowToDepot)
 	{
 		// Turned off: overflow already in crates uploads at normal crate speed from now on.
 		OverflowOwed.Reset();
 	}
-
-	if (RateMode != OldMode || bEnabled != bOldEnabled || bIncludeDeathCrates != bOldDeath || bUploadDeathCrateEquipment != bOldDeathEquipment)
+	if (!bShowStuckNotices)
 	{
-		// A different mode means different timers; start every crate from idle, like a freshly built uploader.
+		// Starting over: items stuck now are announced again once notices are back on.
+		BlockedItems.Reset();
+		PendingNotices.Reset();
+		bGateNoticeSent = false;
+	}
+	if (bSinkWhenDepotFull != bOldSink)
+	{
+		// Count sinks now rather than up to a second later.
+		LastBuildingCountSeconds = -1.0;
+		if (!bSinkWhenDepotFull)
+		{
+			TickSinkSubsystem = nullptr;
+		}
+	}
+
+	if (RateMode != OldMode || bEnabled != bOldEnabled || bIncludeDeathCrates != bOldDeath || bUploadDeathCrateEquipment != bOldDeathEquipment
+		|| bSinkWhenDepotFull != bOldSink)
+	{
+		// Different rules mean different timers (and idle crates may have something to do now); start every crate
+		// from idle, like a freshly built uploader.
 		ResetAllTimers();
 	}
 	UE_LOG(LogDimensionalDismantleCrate, Log, TEXT("Settings: %s"), *DescribeSettings());
@@ -412,12 +507,15 @@ void ADimensionalDismantleCrateSubsystem::ReadConfig()
 
 FString ADimensionalDismantleCrateSubsystem::DescribeSettings() const
 {
-	return FString::Printf(TEXT("%s=%s, %s=%d (%s), %s=%s, %s=%s, %s=%s"),
-		DDC::KeyEnabled, bEnabled ? TEXT("true") : TEXT("false"),
+	return FString::Printf(TEXT("%s=%s, %s=%d (%s), %s=%s, %s=%s, %s=%s, %s=%s, %s=%s, %s=%s"),
+		DDC::KeyEnabled, OnOff(bEnabled),
 		DDC::KeyRateMode, static_cast<int32>(RateMode), DDC::RateModeName(RateMode),
-		DDC::KeyIncludeDeathCrates, bIncludeDeathCrates ? TEXT("true") : TEXT("false"),
-		DDC::KeyUploadDeathCrateEquipment, bUploadDeathCrateEquipment ? TEXT("true") : TEXT("false"),
-		DDC::KeyOverflowToDepot, bOverflowToDepot ? TEXT("true") : TEXT("false"));
+		DDC::KeyIncludeDeathCrates, OnOff(bIncludeDeathCrates),
+		DDC::KeyUploadDeathCrateEquipment, OnOff(bUploadDeathCrateEquipment),
+		DDC::KeyOverflowToDepot, OnOff(bOverflowToDepot),
+		DDC::KeyShowStuckNotices, OnOff(bShowStuckNotices),
+		DDC::KeySinkWhenDepotFull, OnOff(bSinkWhenDepotFull),
+		DDC::KeyRefundsFollowDepotPreference, OnOff(bRefundsFollowDepotPreference));
 }
 
 void ADimensionalDismantleCrateSubsystem::BindConfig()
@@ -506,6 +604,7 @@ void ADimensionalDismantleCrateSubsystem::Tick(const float DeltaSeconds)
 	if (!bGateOpen)
 	{
 		OverflowOwed.Reset();
+		TickSinkSubsystem = nullptr;
 		return;
 	}
 
@@ -514,6 +613,8 @@ void ADimensionalDismantleCrateSubsystem::Tick(const float DeltaSeconds)
 	{
 		return;
 	}
+	RefillDepotTokens();
+	TickSinkSubsystem = (bSinkWhenDepotFull && SinksInWorld > 0) ? AFGResourceSinkSubsystem::Get(GetWorld()) : nullptr;
 
 	bTicking = true;
 	if (bOverflowWork)
@@ -525,8 +626,10 @@ void ADimensionalDismantleCrateSubsystem::Tick(const float DeltaSeconds)
 	{
 		switch (RateMode)
 		{
-		case DDC::ERateMode::Shared: TickShared(DeltaSeconds, TimeToUpload, CentralStorage); break;
+		case DDC::ERateMode::Shared: TickShared(DeltaSeconds, TimeToUpload, 1, CentralStorage); break;
+		case DDC::ERateMode::PerUploader: TickShared(DeltaSeconds, TimeToUpload, FMath::Max(1, UploadersInWorld), CentralStorage); break;
 		case DDC::ERateMode::PerSlot: TickPerSlot(DeltaSeconds, TimeToUpload, CentralStorage); break;
+		case DDC::ERateMode::Instant: TickInstant(DeltaSeconds, CentralStorage); break;
 		case DDC::ERateMode::PerCrate:
 		default: TickPerCrate(DeltaSeconds, TimeToUpload, CentralStorage); break;
 		}
@@ -544,11 +647,37 @@ void ADimensionalDismantleCrateSubsystem::Tick(const float DeltaSeconds)
 	}
 }
 
+int32 ADimensionalDismantleCrateSubsystem::RotationStart() const
+{
+	return Crates.Num() > 0 ? RotationCursor % Crates.Num() : 0;
+}
+
+void ADimensionalDismantleCrateSubsystem::NoteServed(const int32 Index)
+{
+	// Round robin: next tick starts after the last crate that moved an item. While the network budget is used up, the
+	// crate that got the last item goes to the back of the line, so every crate takes its turn.
+	RotationCursor = Crates.Num() > 0 ? (Index + 1) % Crates.Num() : 0;
+}
+
+ADimensionalDismantleCrateSubsystem::FCrateRules ADimensionalDismantleCrateSubsystem::RulesFor(const AFGCrate* Crate) const
+{
+	FCrateRules Rules;
+	const bool bDeath = Crate && Crate->GetCrateType() == EFGCrateType::CT_DeathCrate;
+	Rules.bSkipEquipment = bDeath && !bUploadDeathCrateEquipment;
+	// Never from death crates: those are a player's belongings.
+	Rules.bAllowSink = TickSinkSubsystem != nullptr && Crate && Crate->GetCrateType() == EFGCrateType::CT_DismantleCrate;
+	return Rules;
+}
+
 void ADimensionalDismantleCrateSubsystem::TickPerCrate(const float DeltaSeconds, const float TimeToUpload, AFGCentralStorageSubsystem* CentralStorage)
 {
 	// An upload can destroy the crate (vanilla destroys empty crates); entries are pruned on the next tick.
-	for (int32 Index = 0; Index < Crates.Num(); ++Index)
+	// Starts after the last crate that moved an item, so a used-up network budget is shared out over the crates.
+	const int32 Num = Crates.Num();
+	const int32 Start = RotationStart();
+	for (int32 Step = 0; Step < Num; ++Step)
 	{
+		const int32 Index = (Start + Step) % Num;
 		FTrackedCrate& Entry = Crates[Index];
 		AFGCrate* Crate = Entry.Crate.Get();
 		if (!IsEligible(Crate))
@@ -557,14 +686,17 @@ void ADimensionalDismantleCrateSubsystem::TickPerCrate(const float DeltaSeconds,
 			continue;
 		}
 		UFGInventoryComponent* Inventory = Crate->GetInventory();
-		const bool bSkipEquipment = ShouldSkipEquipment(Crate);
-		Entry.Timer.Step(DeltaSeconds, TimeToUpload, !Inventory->IsEmpty(),
-			[&] { return CanUploadAnySlot(Inventory, CentralStorage, bSkipEquipment); },
-			[&] { return TryUploadOneFromCrate(Inventory, CentralStorage, bSkipEquipment); });
+		const FCrateRules Rules = RulesFor(Crate);
+		if (Entry.Timer.Step(DeltaSeconds, TimeToUpload, !Inventory->IsEmpty(),
+			[&] { return CanMoveAnySlot(Inventory, CentralStorage, Rules); },
+			[&] { return TryMoveOneFromCrate(Inventory, CentralStorage, Rules); }))
+		{
+			NoteServed(Index);
+		}
 	}
 }
 
-void ADimensionalDismantleCrateSubsystem::TickShared(const float DeltaSeconds, const float TimeToUpload, AFGCentralStorageSubsystem* CentralStorage)
+void ADimensionalDismantleCrateSubsystem::TickShared(const float DeltaSeconds, const float TimeToUpload, const int32 Sources, AFGCentralStorageSubsystem* CentralStorage)
 {
 	TArray<int32, TInlineAllocator<32>> Eligible;
 	bool bAnyItems = false;
@@ -578,13 +710,14 @@ void ADimensionalDismantleCrateSubsystem::TickShared(const float DeltaSeconds, c
 		}
 	}
 
-	SharedTimer.Step(DeltaSeconds, TimeToUpload, bAnyItems,
+	// Sources uploaders together: one item every TimeToUpload / Sources seconds, and at most one per uploader per tick.
+	SharedTimer.StepMulti(DeltaSeconds, TimeToUpload / Sources, Sources, bAnyItems,
 		[&]
 		{
 			for (const int32 Index : Eligible)
 			{
 				const AFGCrate* Crate = Crates[Index].Crate.Get();
-				if (CanUploadAnySlot(Crate->GetInventory(), CentralStorage, ShouldSkipEquipment(Crate)))
+				if (IsEligible(Crate) && CanMoveAnySlot(Crate->GetInventory(), CentralStorage, RulesFor(Crate)))
 				{
 					return true;
 				}
@@ -600,24 +733,34 @@ void ADimensionalDismantleCrateSubsystem::TickShared(const float DeltaSeconds, c
 			{
 				++Start;
 			}
+			bool bThrottled = false;
 			for (int32 Step = 0; Step < Count; ++Step)
 			{
 				const int32 Index = Eligible[(Start + Step) % Count];
 				AFGCrate* Crate = Crates[Index].Crate.Get();
-				if (IsEligible(Crate) && TryUploadOneFromCrate(Crate->GetInventory(), CentralStorage, ShouldSkipEquipment(Crate)))
+				if (!IsEligible(Crate))
+				{
+					continue;
+				}
+				const EMoveResult Result = TryMoveOneFromCrate(Crate->GetInventory(), CentralStorage, RulesFor(Crate));
+				if (Result == EMoveResult::Moved)
 				{
 					SharedCursor = Index + 1;
-					return true;
+					return EMoveResult::Moved;
 				}
+				bThrottled |= Result == EMoveResult::Throttled;
 			}
-			return false;
+			return bThrottled ? EMoveResult::Throttled : EMoveResult::Nothing;
 		});
 }
 
 void ADimensionalDismantleCrateSubsystem::TickPerSlot(const float DeltaSeconds, const float TimeToUpload, AFGCentralStorageSubsystem* CentralStorage)
 {
-	for (int32 Index = 0; Index < Crates.Num(); ++Index)
+	const int32 Num = Crates.Num();
+	const int32 Start = RotationStart();
+	for (int32 Step = 0; Step < Num; ++Step)
 	{
+		const int32 Index = (Start + Step) % Num;
 		FTrackedCrate& Entry = Crates[Index];
 		AFGCrate* Crate = Entry.Crate.Get();
 		if (!IsEligible(Crate))
@@ -626,7 +769,7 @@ void ADimensionalDismantleCrateSubsystem::TickPerSlot(const float DeltaSeconds, 
 			continue;
 		}
 		UFGInventoryComponent* Inventory = Crate->GetInventory();
-		const bool bSkipEquipment = ShouldSkipEquipment(Crate);
+		const FCrateRules Rules = RulesFor(Crate);
 		// Merging crates can resize the inventory; new slots start idle.
 		Entry.SlotTimers.SetNum(Inventory->GetSizeLinear());
 		for (int32 Slot = 0; Slot < Entry.SlotTimers.Num(); ++Slot)
@@ -636,16 +779,85 @@ void ADimensionalDismantleCrateSubsystem::TickPerSlot(const float DeltaSeconds, 
 			{
 				break;
 			}
-			Entry.SlotTimers[Slot].Step(DeltaSeconds, TimeToUpload, !Inventory->IsIndexEmpty(Slot),
-				[&] { return CanUploadSlot(Inventory, Slot, CentralStorage, bSkipEquipment); },
-				[&] { return TryUploadSlot(Inventory, Slot, CentralStorage, bSkipEquipment); });
+			if (Entry.SlotTimers[Slot].Step(DeltaSeconds, TimeToUpload, !Inventory->IsIndexEmpty(Slot),
+				[&] { return CanMoveSlot(Inventory, Slot, CentralStorage, Rules); },
+				[&] { return TryMoveSlot(Inventory, Slot, CentralStorage, Rules); }))
+			{
+				NoteServed(Index);
+			}
 		}
 	}
 }
 
-bool ADimensionalDismantleCrateSubsystem::ShouldSkipEquipment(const AFGCrate* Crate) const
+void ADimensionalDismantleCrateSubsystem::TickInstant(const float DeltaSeconds, AFGCentralStorageSubsystem* CentralStorage)
 {
-	return Crate && Crate->GetCrateType() == EFGCrateType::CT_DeathCrate && !bUploadDeathCrateEquipment;
+	// Crates to work on this tick: eligible, holding items, and not waiting out an idle recheck.
+	TArray<int32, TInlineAllocator<64>> Active;
+	const int32 Num = Crates.Num();
+	const int32 Start = RotationStart();
+	for (int32 Step = 0; Step < Num; ++Step)
+	{
+		const int32 Index = (Start + Step) % Num;
+		FTrackedCrate& Entry = Crates[Index];
+		const AFGCrate* Crate = Entry.Crate.Get();
+		if (!IsEligible(Crate))
+		{
+			Entry.Timer.Reset();
+			continue;
+		}
+		if (Entry.Timer.ReadyForInstant(DeltaSeconds, !Crate->GetInventory()->IsEmpty()))
+		{
+			Active.Add(Index);
+		}
+	}
+
+	// Share this tick's item cap over the active crates, pass after pass, until it is used up or no crate can move anything.
+	int32 Budget = DDC::InstantMaxItemsPerTick;
+	while (Active.Num() > 0 && Budget > 0)
+	{
+		const int32 Share = FMath::Max(1, Budget / Active.Num());
+		for (int32 Position = 0; Position < Active.Num() && Budget > 0;)
+		{
+			FTrackedCrate& Entry = Crates[Active[Position]];
+			AFGCrate* Crate = Entry.Crate.Get();
+			bool bDone = !IsEligible(Crate);
+			if (!bDone)
+			{
+				UFGInventoryComponent* Inventory = Crate->GetInventory();
+				const FCrateRules Rules = RulesFor(Crate);
+				for (int32 Moved = 0; Moved < Share && Budget > 0; ++Moved)
+				{
+					const EMoveResult Result = TryMoveOneFromCrate(Inventory, CentralStorage, Rules);
+					if (Result == EMoveResult::Moved)
+					{
+						--Budget;
+						NoteServed(Active[Position]);
+						if (!IsValid(Crate) || Crate->IsActorBeingDestroyed())
+						{
+							bDone = true; // emptied; the game destroys empty crates
+							break;
+						}
+						continue;
+					}
+					if (Result == EMoveResult::Nothing)
+					{
+						Entry.Timer.GoIdle();
+					}
+					// Nothing, or Throttled (the budget is used up; the crate stays ready and tries again next tick).
+					bDone = true;
+					break;
+				}
+			}
+			if (bDone)
+			{
+				Active.RemoveAtSwap(Position);
+			}
+			else
+			{
+				++Position;
+			}
+		}
+	}
 }
 
 bool ADimensionalDismantleCrateSubsystem::IsEquipmentOrStateful(const FInventoryStack& Stack)
@@ -654,20 +866,38 @@ bool ADimensionalDismantleCrateSubsystem::IsEquipmentOrStateful(const FInventory
 	return Stack.Item.HasState() || (ItemClass && ItemClass->IsChildOf(UFGEquipmentDescriptor::StaticClass()));
 }
 
-bool ADimensionalDismantleCrateSubsystem::CanUploadSlot(const UFGInventoryComponent* Inventory, const int32 SlotIndex, const AFGCentralStorageSubsystem* CentralStorage, const bool bSkipEquipment)
+bool ADimensionalDismantleCrateSubsystem::IsDepotFullOf(const AFGCentralStorageSubsystem* CentralStorage, const TSubclassOf<UFGItemDescriptor> Item)
 {
-	FInventoryStack Stack;
-	return Inventory->GetStackFromIndex(SlotIndex, Stack) && Stack.HasItems()
-		&& !(bSkipEquipment && IsEquipmentOrStateful(Stack))
-		&& CentralStorage->CanUploadInventoryItemToCentralStorage(Stack.Item);
+	return Item && CentralStorage->GetNumItemsFromCentralStorage(Item) >= CentralStorage->GetCentralStorageItemLimit(Item);
 }
 
-bool ADimensionalDismantleCrateSubsystem::CanUploadAnySlot(const UFGInventoryComponent* Inventory, const AFGCentralStorageSubsystem* CentralStorage, const bool bSkipEquipment)
+bool ADimensionalDismantleCrateSubsystem::CanSinkStack(const FInventoryStack& Stack, const AFGCentralStorageSubsystem* CentralStorage, const FCrateRules& Rules) const
+{
+	if (!Rules.bAllowSink || !TickSinkSubsystem || !Stack.HasItems() || IsEquipmentOrStateful(Stack))
+	{
+		return false;
+	}
+	const TSubclassOf<UFGItemDescriptor> Item = Stack.Item.GetItemClass();
+	// Only what the depot is full of: anything the depot refuses for another reason stays in the crate.
+	return IsDepotFullOf(CentralStorage, Item) && TickSinkSubsystem->GetResourceSinkPointsForItem(Item) > 0;
+}
+
+bool ADimensionalDismantleCrateSubsystem::CanMoveSlot(const UFGInventoryComponent* Inventory, const int32 SlotIndex, const AFGCentralStorageSubsystem* CentralStorage, const FCrateRules& Rules) const
+{
+	FInventoryStack Stack;
+	if (!Inventory->GetStackFromIndex(SlotIndex, Stack) || !Stack.HasItems() || (Rules.bSkipEquipment && IsEquipmentOrStateful(Stack)))
+	{
+		return false;
+	}
+	return CentralStorage->CanUploadInventoryItemToCentralStorage(Stack.Item) || CanSinkStack(Stack, CentralStorage, Rules);
+}
+
+bool ADimensionalDismantleCrateSubsystem::CanMoveAnySlot(const UFGInventoryComponent* Inventory, const AFGCentralStorageSubsystem* CentralStorage, const FCrateRules& Rules) const
 {
 	const int32 Size = Inventory->GetSizeLinear();
 	for (int32 Slot = 0; Slot < Size; ++Slot)
 	{
-		if (CanUploadSlot(Inventory, Slot, CentralStorage, bSkipEquipment))
+		if (CanMoveSlot(Inventory, Slot, CentralStorage, Rules))
 		{
 			return true;
 		}
@@ -675,41 +905,88 @@ bool ADimensionalDismantleCrateSubsystem::CanUploadAnySlot(const UFGInventoryCom
 	return false;
 }
 
-bool ADimensionalDismantleCrateSubsystem::TryUploadSlot(UFGInventoryComponent* Inventory, const int32 SlotIndex, AFGCentralStorageSubsystem* CentralStorage, const bool bSkipEquipment)
+EMoveResult ADimensionalDismantleCrateSubsystem::TryUploadSlot(UFGInventoryComponent* Inventory, const int32 SlotIndex, AFGCentralStorageSubsystem* CentralStorage, const FCrateRules& Rules)
 {
-	if (Inventory->IsIndexEmpty(SlotIndex))
+	FInventoryStack Stack;
+	if (!Inventory->GetStackFromIndex(SlotIndex, Stack) || !Stack.HasItems() || (Rules.bSkipEquipment && IsEquipmentOrStateful(Stack)))
 	{
-		return false;
+		return EMoveResult::Nothing;
 	}
-	if (bSkipEquipment)
+	if (!HasDepotToken())
 	{
-		FInventoryStack Stack;
-		if (!Inventory->GetStackFromIndex(SlotIndex, Stack) || IsEquipmentOrStateful(Stack))
-		{
-			return false;
-		}
+		return CentralStorage->CanUploadInventoryItemToCentralStorage(Stack.Item) ? EMoveResult::Throttled : EMoveResult::Nothing;
 	}
 	// UploadItemFromInventoryToCentralStorage checks the item and the depot limit itself, and moves exactly one item.
 	if (!CentralStorage->UploadItemFromInventoryToCentralStorage(Inventory, SlotIndex))
 	{
+		return EMoveResult::Nothing;
+	}
+	SpendDepotToken();
+	NoteUpload();
+	return EMoveResult::Moved;
+}
+
+bool ADimensionalDismantleCrateSubsystem::TrySinkSlot(UFGInventoryComponent* Inventory, const int32 SlotIndex, const AFGCentralStorageSubsystem* CentralStorage, const FCrateRules& Rules)
+{
+	FInventoryStack Stack;
+	if (!Inventory->GetStackFromIndex(SlotIndex, Stack) || !CanSinkStack(Stack, CentralStorage, Rules))
+	{
 		return false;
 	}
-	NoteUpload();
+	// Points first: if the sink refuses the item, it stays in the crate.
+	if (!TickSinkSubsystem->AddPoints_ThreadSafe(Stack.Item.GetItemClass()))
+	{
+		return false;
+	}
+	Inventory->RemoveFromIndex(SlotIndex, 1);
+	++ItemsSunk;
 	return true;
 }
 
-bool ADimensionalDismantleCrateSubsystem::TryUploadOneFromCrate(UFGInventoryComponent* Inventory, AFGCentralStorageSubsystem* CentralStorage, const bool bSkipEquipment)
+EMoveResult ADimensionalDismantleCrateSubsystem::TryMoveSlot(UFGInventoryComponent* Inventory, const int32 SlotIndex, AFGCentralStorageSubsystem* CentralStorage, const FCrateRules& Rules)
 {
-	// Same order as the vanilla uploader: the first slot that accepts an item wins.
-	const int32 Size = Inventory->GetSizeLinear();
-	for (int32 Slot = 0; Slot < Size; ++Slot)
+	const EMoveResult Upload = TryUploadSlot(Inventory, SlotIndex, CentralStorage, Rules);
+	if (Upload == EMoveResult::Moved)
 	{
-		if (TryUploadSlot(Inventory, Slot, CentralStorage, bSkipEquipment))
+		return Upload;
+	}
+	return (Rules.bAllowSink && TrySinkSlot(Inventory, SlotIndex, CentralStorage, Rules)) ? EMoveResult::Moved : Upload;
+}
+
+EMoveResult ADimensionalDismantleCrateSubsystem::TryMoveOneFromCrate(UFGInventoryComponent* Inventory, AFGCentralStorageSubsystem* CentralStorage, const FCrateRules& Rules)
+{
+	// Uploads first, in the vanilla uploader's order: the first slot that accepts an item wins.
+	const int32 Size = Inventory->GetSizeLinear();
+	bool bThrottled = false;
+	if (HasDepotToken())
+	{
+		for (int32 Slot = 0; Slot < Size; ++Slot)
 		{
-			return true;
+			const EMoveResult Result = TryUploadSlot(Inventory, Slot, CentralStorage, Rules);
+			if (Result == EMoveResult::Moved)
+			{
+				return Result;
+			}
+			bThrottled |= Result == EMoveResult::Throttled;
 		}
 	}
-	return false;
+	else
+	{
+		// Budget used up: don't scan for uploads. If the crate has nothing to upload, it learns that once the budget is back.
+		bThrottled = true;
+	}
+	// Then the sink, for items the depot is full of. Sinking sends nothing to the depot, so it doesn't use the budget.
+	if (Rules.bAllowSink)
+	{
+		for (int32 Slot = 0; Slot < Size; ++Slot)
+		{
+			if (TrySinkSlot(Inventory, Slot, CentralStorage, Rules))
+			{
+				return EMoveResult::Moved;
+			}
+		}
+	}
+	return bThrottled ? EMoveResult::Throttled : EMoveResult::Nothing;
 }
 
 void ADimensionalDismantleCrateSubsystem::NoteUpload()
@@ -724,7 +1001,65 @@ void ADimensionalDismantleCrateSubsystem::NoteUpload()
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Dismantle overflow straight to the depot
+// Dismantle refunds straight to the depot (overflow, and depot first)
+
+UFGInventoryComponent* ADimensionalDismantleCrateSubsystem::GetScratchInventory()
+{
+	if (!ScratchInventory)
+	{
+		// Never replicated or saved (this subsystem is neither), and always emptied again before UploadStackDirect returns.
+		ScratchInventory = NewObject<UFGInventoryComponent>(this, TEXT("DDCOverflowScratch"));
+		ScratchInventory->SetIsReplicated(false);
+		ScratchInventory->RegisterComponent();
+		ScratchInventory->Resize(1);
+	}
+	return ScratchInventory;
+}
+
+int32 ADimensionalDismantleCrateSubsystem::UploadStackDirect(const FInventoryStack& Stack, AFGCentralStorageSubsystem* CentralStorage, FInventoryStack& OutLeft, bool& bOutStoppedByBudget)
+{
+	OutLeft = Stack;
+	bOutStoppedByBudget = false;
+	UFGInventoryComponent* Scratch = GetScratchInventory();
+	if (!Stack.HasItems() || !Scratch || !CentralStorage->CanUploadInventoryItemToCentralStorage(Stack.Item))
+	{
+		return 0;
+	}
+	if (!HasDepotToken())
+	{
+		bOutStoppedByBudget = true;
+		return 0;
+	}
+	// The game only uploads from an inventory slot. One slot sized to the whole stack, because refund stacks can be
+	// larger than a normal stack; the item (and any state it carries) is uploaded exactly as from a crate.
+	Scratch->Empty();
+	Scratch->AddArbitrarySlotSize(0, Stack.NumItems);
+	if (Scratch->AddStackToIndex(0, Stack, true) != Stack.NumItems)
+	{
+		// Not expected; the stack stays where it was going.
+		Scratch->Empty();
+		return 0;
+	}
+	int32 Sent = 0;
+	while (!Scratch->IsIndexEmpty(0))
+	{
+		if (!HasDepotToken())
+		{
+			bOutStoppedByBudget = true;
+			break;
+		}
+		if (!CentralStorage->UploadItemFromInventoryToCentralStorage(Scratch, 0))
+		{
+			break; // the depot reached its limit for this item
+		}
+		SpendDepotToken();
+		++Sent;
+	}
+	FInventoryStack Left;
+	OutLeft = (Scratch->GetStackFromIndex(0, Left) && Left.HasItems()) ? Left : FInventoryStack();
+	Scratch->Empty();
+	return Sent;
+}
 
 bool ADimensionalDismantleCrateSubsystem::SendOverflowToDepot(const TArray<FInventoryStack>& Refund, TArray<FInventoryStack>& OutRemaining)
 {
@@ -734,13 +1069,12 @@ bool ADimensionalDismantleCrateSubsystem::SendOverflowToDepot(const TArray<FInve
 		return false;
 	}
 	AFGCentralStorageSubsystem* CentralStorage = AFGCentralStorageSubsystem::Get(GetWorld());
-	UFGInventoryComponent* Scratch = GetScratchInventory();
-	if (!CentralStorage || !Scratch)
+	if (!CentralStorage || !GetScratchInventory())
 	{
 		return false;
 	}
 
-	RefillOverflowTokens();
+	RefillDepotTokens();
 	int32 Sent = 0;
 	int32 Kept = 0;
 	for (const FInventoryStack& Stack : Refund)
@@ -749,51 +1083,20 @@ bool ADimensionalDismantleCrateSubsystem::SendOverflowToDepot(const TArray<FInve
 		{
 			continue;
 		}
-		if (!CentralStorage->CanUploadInventoryItemToCentralStorage(Stack.Item))
-		{
-			// The depot won't take it (at its limit, or not an item the depot stores): it goes into the crate as before.
-			OutRemaining.Add(Stack);
-			Kept += Stack.NumItems;
-			continue;
-		}
-		if (OverflowTokens < 1.0f)
-		{
-			// Rate used up: into the crate, and sent from there at the overflow rate.
-			OutRemaining.Add(Stack);
-			Kept += Stack.NumItems;
-			OverflowOwed.FindOrAdd(Stack.Item.GetItemClass()) += Stack.NumItems;
-			continue;
-		}
-
-		// The game only uploads from an inventory slot. One slot sized to the whole stack, because refund stacks can be
-		// larger than a normal stack; the item (and any state it carries) is uploaded exactly as from a crate.
-		Scratch->Empty();
-		Scratch->AddArbitrarySlotSize(0, Stack.NumItems);
-		if (Scratch->AddStackToIndex(0, Stack, true) != Stack.NumItems)
-		{
-			// Not expected; the stack goes into the crate untouched.
-			Scratch->Empty();
-			OutRemaining.Add(Stack);
-			Kept += Stack.NumItems;
-			continue;
-		}
-		while (OverflowTokens >= 1.0f && !Scratch->IsIndexEmpty(0) && CentralStorage->UploadItemFromInventoryToCentralStorage(Scratch, 0))
-		{
-			OverflowTokens -= 1.0f;
-			++Sent;
-		}
 		FInventoryStack Left;
-		if (Scratch->GetStackFromIndex(0, Left) && Left.HasItems())
+		bool bStoppedByBudget = false;
+		Sent += UploadStackDirect(Stack, CentralStorage, Left, bStoppedByBudget);
+		if (Left.HasItems())
 		{
+			// The depot won't take it (at its limit, or not an item the depot stores), or the budget is used up: it
+			// goes into the crate. Held back by the budget, it is sent from there at the budget's rate.
 			OutRemaining.Add(Left);
 			Kept += Left.NumItems;
-			if (OverflowTokens < 1.0f)
+			if (bStoppedByBudget)
 			{
-				// Stopped by the rate, not by the depot.
 				OverflowOwed.FindOrAdd(Left.Item.GetItemClass()) += Left.NumItems;
 			}
 		}
-		Scratch->Empty();
 	}
 
 	ItemsSentDirectly += Sent;
@@ -801,17 +1104,51 @@ bool ADimensionalDismantleCrateSubsystem::SendOverflowToDepot(const TArray<FInve
 	return true;
 }
 
-UFGInventoryComponent* ADimensionalDismantleCrateSubsystem::GetScratchInventory()
+const TCHAR* ADimensionalDismantleCrateSubsystem::WhyNotRefundToDepotFirst(const AFGPlayerState* PlayerState)
 {
-	if (!ScratchInventory)
+	if (!HasAuthority())
 	{
-		// Never replicated or saved (this subsystem is neither), and always emptied again before SendOverflowToDepot returns.
-		ScratchInventory = NewObject<UFGInventoryComponent>(this, TEXT("DDCOverflowScratch"));
-		ScratchInventory->SetIsReplicated(false);
-		ScratchInventory->RegisterComponent();
-		ScratchInventory->Resize(1);
+		return TEXT("not the server");
 	}
-	return ScratchInventory;
+	if (!bRefundsFollowDepotPreference)
+	{
+		return TEXT("the option is off");
+	}
+	if (!PlayerState)
+	{
+		return TEXT("no player state");
+	}
+	// The player's own vanilla setting: "take from inventory before depot" off means the depot comes first for them.
+	if (PlayerState->GetTakeFromInventoryBeforeCentralStorage())
+	{
+		return TEXT("the player takes from the inventory before the depot");
+	}
+	if (!IsGateOpen())
+	{
+		return TEXT("the depot research or an uploader is missing");
+	}
+	return nullptr;
+}
+
+int32 ADimensionalDismantleCrateSubsystem::SendRefundStackToDepot(const FInventoryStack& Stack, FInventoryStack& OutLeft)
+{
+	OutLeft = Stack;
+	AFGCentralStorageSubsystem* CentralStorage = AFGCentralStorageSubsystem::Get(GetWorld());
+	if (!Stack.HasItems() || !CentralStorage)
+	{
+		return 0;
+	}
+	RefillDepotTokens();
+	// What the budget holds back goes to the inventory, like anything else the depot doesn't take.
+	bool bStoppedByBudget = false;
+	const int32 Sent = UploadStackDirect(Stack, CentralStorage, OutLeft, bStoppedByBudget);
+	ItemsRefundedToDepot += Sent;
+	if (Sent > 0)
+	{
+		UE_LOG(LogDimensionalDismantleCrate, Verbose, TEXT("Depot-first refund: sent %d %s to the depot, %d go to the inventory%s"), Sent,
+			*GetNameSafe(Stack.Item.GetItemClass()), OutLeft.NumItems, bStoppedByBudget ? TEXT(" (network budget used up)") : TEXT(""));
+	}
+	return Sent;
 }
 
 bool ADimensionalDismantleCrateSubsystem::HasRemoteClients() const
@@ -821,32 +1158,32 @@ bool ADimensionalDismantleCrateSubsystem::HasRemoteClients() const
 	return Driver && Driver->ClientConnections.Num() > 0;
 }
 
-void ADimensionalDismantleCrateSubsystem::RefillOverflowTokens()
+void ADimensionalDismantleCrateSubsystem::RefillDepotTokens()
 {
 	const bool bNetworked = HasRemoteClients();
-	float Rate = bNetworked ? DDC::OverflowItemsPerSecondNetworked : DDC::OverflowItemsPerSecondLocal;
-	float Burst = bNetworked ? DDC::OverflowBurstNetworked : DDC::OverflowBurstLocal;
+	float Rate = bNetworked ? DDC::DepotAddsPerSecondNetworked : DDC::DepotAddsPerSecondLocal;
+	float Burst = bNetworked ? DDC::DepotAddsBurstNetworked : DDC::DepotAddsBurstLocal;
 #if DDC_DEV_COMMANDS
-	Rate = DevOverflowRate > 0.0f ? DevOverflowRate : Rate;
-	Burst = DevOverflowBurst > 0.0f ? DevOverflowBurst : Burst;
+	Rate = DevBudgetRate > 0.0f ? DevBudgetRate : Rate;
+	Burst = DevBudgetBurst > 0.0f ? DevBudgetBurst : Burst;
 #endif
 	const double Now = FPlatformTime::Seconds();
-	const float Refilled = OverflowTokensRefilledAt < 0.0 ? Burst : OverflowTokens + static_cast<float>((Now - OverflowTokensRefilledAt) * Rate);
-	OverflowTokens = FMath::Min(Burst, Refilled);
-	OverflowTokensRefilledAt = Now;
+	const float Refilled = DepotTokensRefilledAt < 0.0 ? Burst : DepotTokens + static_cast<float>((Now - DepotTokensRefilledAt) * Rate);
+	DepotTokens = FMath::Min(Burst, Refilled);
+	DepotTokensRefilledAt = Now;
 }
 
 void ADimensionalDismantleCrateSubsystem::TickOverflowFromCrates(AFGCentralStorageSubsystem* CentralStorage)
 {
-	RefillOverflowTokens();
-	for (auto It = OverflowOwed.CreateIterator(); It && OverflowTokens >= 1.0f; ++It)
+	// Tokens were refilled at the start of this tick.
+	for (auto It = OverflowOwed.CreateIterator(); It && HasDepotToken(); ++It)
 	{
 		const TSubclassOf<UFGItemDescriptor> Item = It.Key();
 		int32& Owed = It.Value();
 		bool bDepotRefused = false;
 		// Newest crates first: a crate made for the overflow was tracked last. Overflow merged into an older crate is
 		// found there too.
-		for (int32 Index = Crates.Num() - 1; Index >= 0 && Owed > 0 && OverflowTokens >= 1.0f && !bDepotRefused; --Index)
+		for (int32 Index = Crates.Num() - 1; Index >= 0 && Owed > 0 && HasDepotToken() && !bDepotRefused; --Index)
 		{
 			AFGCrate* Crate = Crates[Index].Crate.Get();
 			UFGInventoryComponent* Inventory = IsValid(Crate) && !Crate->IsActorBeingDestroyed() && Crate->HasActorBegunPlay()
@@ -856,14 +1193,14 @@ void ADimensionalDismantleCrateSubsystem::TickOverflowFromCrates(AFGCentralStora
 				continue;
 			}
 			const int32 Size = Inventory->GetSizeLinear();
-			for (int32 Slot = 0; Slot < Size && Owed > 0 && OverflowTokens >= 1.0f; ++Slot)
+			for (int32 Slot = 0; Slot < Size && Owed > 0 && HasDepotToken(); ++Slot)
 			{
 				FInventoryStack Stack;
 				if (!Inventory->GetStackFromIndex(Slot, Stack) || !Stack.HasItems() || Stack.Item.GetItemClass() != Item)
 				{
 					continue;
 				}
-				while (Owed > 0 && OverflowTokens >= 1.0f && !Inventory->IsIndexEmpty(Slot))
+				while (Owed > 0 && HasDepotToken() && !Inventory->IsIndexEmpty(Slot))
 				{
 					if (!CentralStorage->UploadItemFromInventoryToCentralStorage(Inventory, Slot))
 					{
@@ -871,7 +1208,7 @@ void ADimensionalDismantleCrateSubsystem::TickOverflowFromCrates(AFGCentralStora
 						break;
 					}
 					--Owed;
-					OverflowTokens -= 1.0f;
+					SpendDepotToken();
 					++ItemsSentDirectly;
 					if (!IsValid(Crate) || Crate->IsActorBeingDestroyed())
 					{
@@ -884,9 +1221,9 @@ void ADimensionalDismantleCrateSubsystem::TickOverflowFromCrates(AFGCentralStora
 				}
 			}
 		}
-		// Still owed with rate to spare: the depot is full of the item, or no crate holds it any more (a player took
+		// Still owed with budget to spare: the depot is full of the item, or no crate holds it any more (a player took
 		// it). Either way the rest is no longer overflow; anything still in a crate uploads at normal crate speed.
-		if (bDepotRefused || (Owed > 0 && OverflowTokens >= 1.0f))
+		if (bDepotRefused || (Owed > 0 && HasDepotToken()))
 		{
 			Owed = 0;
 		}
@@ -910,6 +1247,157 @@ int32 ADimensionalDismantleCrateSubsystem::GetOverflowOwedItems() const
 #endif
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Stuck-crate notices
+
+void ADimensionalDismantleCrateSubsystem::ScanForNotices()
+{
+	UWorld* World = GetWorld();
+	if (!HasAuthority() || !World || !bEnabled || !bShowStuckNotices)
+	{
+		return;
+	}
+	if (World->GetNumPlayerControllers() == 0)
+	{
+		// Nobody to tell; keep the state, so whatever is stuck is announced to the next player who joins.
+		return;
+	}
+	const double Now = World->GetTimeSeconds();
+	const bool bGapPassed = LastNoticeSeconds < 0.0 || Now - LastNoticeSeconds >= DDC::NoticeMinGapSeconds;
+
+	bool bAnyItems = false;
+	for (const FTrackedCrate& Entry : Crates)
+	{
+		const AFGCrate* Crate = Entry.Crate.Get();
+		if (IsEligible(Crate) && !Crate->GetInventory()->IsEmpty())
+		{
+			bAnyItems = true;
+			break;
+		}
+	}
+
+	if (!IsGateOpen())
+	{
+		BlockedItems.Reset();
+		PendingNotices.Reset();
+		// Before the research nobody expects uploading, so only the missing uploader is worth a word.
+		if (bAnyItems && UploadersInWorld == 0 && IsResearchDone() && !bGateNoticeSent && bGapPassed
+			&& (LastGateNoticeSeconds < 0.0 || Now - LastGateNoticeSeconds >= DDC::NoticeItemRepeatSeconds))
+		{
+			SendNotice(TEXT("dismantle crates start uploading to the Dimensional Depot once a Dimensional Depot Uploader is built."));
+			bGateNoticeSent = true;
+			LastGateNoticeSeconds = Now;
+		}
+		return;
+	}
+	bGateNoticeSent = false;
+
+	const AFGCentralStorageSubsystem* CentralStorage = AFGCentralStorageSubsystem::Get(World);
+	if (!CentralStorage)
+	{
+		return;
+	}
+	// Items that can't go anywhere: not uploadable now and not sinkable. Equipment a death crate keeps by the player's
+	// own setting is not stuck, so it is left out.
+	TMap<TSubclassOf<UFGItemDescriptor>, FStuckItem> Stuck;
+	for (const FTrackedCrate& Entry : Crates)
+	{
+		const AFGCrate* Crate = Entry.Crate.Get();
+		if (!IsEligible(Crate))
+		{
+			continue;
+		}
+		const UFGInventoryComponent* Inventory = Crate->GetInventory();
+		const FCrateRules Rules = RulesFor(Crate);
+		const int32 Size = Inventory->GetSizeLinear();
+		for (int32 Slot = 0; Slot < Size; ++Slot)
+		{
+			FInventoryStack Stack;
+			if (!Inventory->GetStackFromIndex(Slot, Stack) || !Stack.HasItems() || (Rules.bSkipEquipment && IsEquipmentOrStateful(Stack))
+				|| CentralStorage->CanUploadInventoryItemToCentralStorage(Stack.Item) || CanSinkStack(Stack, CentralStorage, Rules))
+			{
+				continue;
+			}
+			const TSubclassOf<UFGItemDescriptor> Item = Stack.Item.GetItemClass();
+			FStuckItem& StuckEntry = Stuck.FindOrAdd(Item);
+			StuckEntry.Count += Stack.NumItems;
+			StuckEntry.bDepotFull = IsDepotFullOf(CentralStorage, Item);
+		}
+	}
+
+	// Items that got moving again are forgotten, so they are announced again if they get stuck later (at most every
+	// NoticeItemRepeatSeconds per item).
+	for (auto It = BlockedItems.CreateIterator(); It; ++It)
+	{
+		if (!Stuck.Contains(It.Key()))
+		{
+			PendingNotices.Remove(It.Key());
+			It.RemoveCurrent();
+		}
+	}
+	for (const TPair<TSubclassOf<UFGItemDescriptor>, FStuckItem>& Pair : Stuck)
+	{
+		if (!BlockedItems.Contains(Pair.Key))
+		{
+			BlockedItems.Add(Pair.Key, Now);
+			const double* Last = LastAnnounced.Find(Pair.Key);
+			if (!Last || Now - *Last >= DDC::NoticeItemRepeatSeconds)
+			{
+				PendingNotices.Add(Pair.Key, Pair.Value);
+			}
+		}
+		else if (FStuckItem* Pending = PendingNotices.Find(Pair.Key))
+		{
+			*Pending = Pair.Value;
+		}
+	}
+	if (PendingNotices.Num() == 0 || !bGapPassed)
+	{
+		return;
+	}
+
+	TArray<FString> Full;
+	TArray<FString> Refused;
+	for (const TPair<TSubclassOf<UFGItemDescriptor>, FStuckItem>& Pair : PendingNotices)
+	{
+		const FString Name = FString::Printf(TEXT("%s (%d)"), *UFGItemDescriptor::GetItemName(Pair.Key).ToString(), Pair.Value.Count);
+		(Pair.Value.bDepotFull ? Full : Refused).Add(Name);
+		LastAnnounced.Add(Pair.Key, Now);
+	}
+	PendingNotices.Reset();
+	FString Text;
+	if (Full.Num() > 0)
+	{
+		Text = FString::Printf(TEXT("the Dimensional Depot is full of %s; %s in crates until it has room."), *JoinItems(Full),
+			Full.Num() == 1 ? TEXT("it stays") : TEXT("they stay"));
+	}
+	if (Refused.Num() > 0)
+	{
+		Text += FString::Printf(TEXT("%sthe Dimensional Depot doesn't accept %s; %s in crates."), Text.IsEmpty() ? TEXT("") : TEXT(" Also, "),
+			*JoinItems(Refused), Refused.Num() == 1 ? TEXT("it stays") : TEXT("they stay"));
+	}
+	SendNotice(Text);
+}
+
+void ADimensionalDismantleCrateSubsystem::SendNotice(const FString& Text)
+{
+	UWorld* World = GetWorld();
+	AFGChatManager* Chat = World ? AFGChatManager::Get(World) : nullptr;
+	if (!Chat)
+	{
+		return;
+	}
+	// A system message through the game's own chat, which reaches every player, with or without this mod.
+	FChatMessageStruct Message;
+	Message.MessageType = EFGChatMessageType::CMT_SystemMessage;
+	Message.MessageText = FText::FromString(FString::Printf(TEXT("Dimensional Dismantle Crate: %s"), *Text));
+	Chat->BroadcastChatMessage(Message, nullptr);
+	LastNoticeSeconds = World->GetTimeSeconds();
+	++NoticesSent;
+	LastNoticeText = Message.MessageText.ToString();
+	UE_LOG(LogDimensionalDismantleCrate, Log, TEXT("Notice: %s"), *LastNoticeText);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Console support
 
 bool ADimensionalDismantleCrateSubsystem::SetConfigValue(const UWorld* World, const FString& Key, const FString& ValueText, FString& OutMessage)
@@ -924,8 +1412,9 @@ bool ADimensionalDismantleCrateSubsystem::SetConfigValue(const UWorld* World, co
 	UConfigProperty* Property = FindProperty(Root, Key, &CanonicalKey);
 	if (!Property)
 	{
-		OutMessage = FString::Printf(TEXT("Unknown key '%s' (or the configuration is not registered). Valid keys: %s, %s, %s, %s, %s"),
-			*Key, DDC::KeyEnabled, DDC::KeyRateMode, DDC::KeyIncludeDeathCrates, DDC::KeyUploadDeathCrateEquipment, DDC::KeyOverflowToDepot);
+		OutMessage = FString::Printf(TEXT("Unknown key '%s' (or the configuration is not registered). Valid keys: %s, %s, %s, %s, %s, %s, %s, %s"),
+			*Key, DDC::KeyEnabled, DDC::KeyRateMode, DDC::KeyIncludeDeathCrates, DDC::KeyUploadDeathCrateEquipment, DDC::KeyOverflowToDepot,
+			DDC::KeyShowStuckNotices, DDC::KeySinkWhenDepotFull, DDC::KeyRefundsFollowDepotPreference);
 		return false;
 	}
 
@@ -940,7 +1429,7 @@ bool ADimensionalDismantleCrateSubsystem::SetConfigValue(const UWorld* World, co
 		Bool->Value = bValue;
 		// MarkDirty saves the file, refreshes SML's caches and fires OnPropertyValueChanged, which applies the value.
 		Bool->MarkDirty();
-		OutMessage = FString::Printf(TEXT("%s set to %s."), *CanonicalKey, bValue ? TEXT("true") : TEXT("false"));
+		OutMessage = FString::Printf(TEXT("%s set to %s."), *CanonicalKey, OnOff(bValue));
 		return true;
 	}
 	if (UConfigPropertyInteger* Integer = Cast<UConfigPropertyInteger>(Property))
@@ -948,7 +1437,7 @@ bool ADimensionalDismantleCrateSubsystem::SetConfigValue(const UWorld* World, co
 		int32 Value = 0;
 		if (!ParseRateMode(ValueText, Value))
 		{
-			OutMessage = FString::Printf(TEXT("Refused: %s takes 0 (PerCrate), 1 (Shared) or 2 (PerSlot)."), *CanonicalKey);
+			OutMessage = FString::Printf(TEXT("Refused: %s takes 0 (PerCrate), 1 (Shared), 2 (PerSlot), 3 (Instant) or 4 (PerUploader)."), *CanonicalKey);
 			return false;
 		}
 		Integer->Value = Value;
@@ -979,6 +1468,14 @@ void ADimensionalDismantleCrateSubsystem::DescribeStatus(FOutputDevice& Ar) cons
 	{
 		const float Time = CentralStorage->GetCentralStorageTimeToUpload();
 		Lines.Add(FString::Printf(TEXT("  Upload speed: %.4f s/item (%.2f items/min per uploader)"), Time, Time > 0.0f ? 60.0f / Time : 0.0f));
+	}
+	Lines.Add(FString::Printf(TEXT("  Network budget: %s (%.0f items/s, burst %.0f), %.1f available"), HasRemoteClients() ? TEXT("players connected") : TEXT("no remote players"),
+		HasRemoteClients() ? DDC::DepotAddsPerSecondNetworked : DDC::DepotAddsPerSecondLocal,
+		HasRemoteClients() ? DDC::DepotAddsBurstNetworked : DDC::DepotAddsBurstLocal, DepotTokens));
+	if (bSinkWhenDepotFull)
+	{
+		Lines.Add(FString::Printf(TEXT("  Sinking: %d AWESOME Sink(s) built -> %s; %lld item(s) sunk since the world started"), CountSinksInWorld(),
+			CountSinksInWorld() > 0 ? TEXT("on") : TEXT("waiting for a sink"), ItemsSunk));
 	}
 
 	constexpr int32 MaxCratesListed = 20;
@@ -1032,7 +1529,23 @@ void ADimensionalDismantleCrateSubsystem::DescribeStatus(FOutputDevice& Ar) cons
 		OverflowWaiting += Pair.Value;
 	}
 	Lines.Add(FString::Printf(TEXT("  Dismantle overflow straight to the depot: %s, %lld item(s) sent since the world started, %d waiting in crates"),
-		bOverflowToDepot ? TEXT("on") : TEXT("off"), ItemsSentDirectly, OverflowWaiting));
+		OnOff(bOverflowToDepot), ItemsSentDirectly, OverflowWaiting));
+	Lines.Add(FString::Printf(TEXT("  Dismantle refunds to the depot first (players whose 'take from inventory before depot' is off): %s, %lld item(s) since the world started"),
+		OnOff(bRefundsFollowDepotPreference), ItemsRefundedToDepot));
+	if (World)
+	{
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			const APlayerController* Controller = It->Get();
+			const AFGPlayerState* PlayerState = Controller ? Controller->GetPlayerState<AFGPlayerState>() : nullptr;
+			if (PlayerState)
+			{
+				Lines.Add(FString::Printf(TEXT("    %s: take from inventory before depot = %s"), *PlayerState->GetPlayerName(),
+					OnOff(PlayerState->GetTakeFromInventoryBeforeCentralStorage())));
+			}
+		}
+	}
+	Lines.Add(FString::Printf(TEXT("  Stuck-crate notices: %s, %d sent, %d item type(s) stuck now"), OnOff(bShowStuckNotices), NoticesSent, BlockedItems.Num()));
 
 	for (const FString& Line : Lines)
 	{

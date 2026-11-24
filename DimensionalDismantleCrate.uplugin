@@ -1,11 +1,11 @@
 {
 	"FileVersion": 3,
 	"Version": 0,
-	"VersionName": "0.2.0",
-	"SemVersion": "0.2.0",
-	"GameVersion": ">=517554",
+	"VersionName": "0.3.0",
+	"SemVersion": "0.3.0",
+	"GameVersion": ">=520140",
 	"FriendlyName": "Dimensional Dismantle Crate",
-	"Description": "Dismantle crates upload their contents to the Dimensional Depot by themselves, at the same speed as an uploader, whenever the depot has room. Optionally, dismantle overflow that does not fit your inventory goes straight into the depot. Needs the Dimensional Depot research and at least one uploader built. Only the host or server needs this mod.",
+	"Description": "Dismantle crates upload their contents to the Dimensional Depot by themselves, at the speed of an uploader or faster if you choose, whenever the depot has room. Optional: dismantle overflow and refunds straight to the depot, sinking what the depot is full of, and chat notices when crates can't empty. Needs the Dimensional Depot research and at least one uploader built. Only the host or server needs this mod.",
 	"Category": "Modding",
 	"CreatedBy": "Zambie223",
 	"CreatedByURL": "https://github.com/Zambie223",
@@ -28,7 +28,7 @@
 		{
 			"Name": "SML",
 			"Enabled": true,
-			"SemVersion": "^3.12.0"
+			"SemVersion": "^3.12.1"
 		}
 	]
 }
