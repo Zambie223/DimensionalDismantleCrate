@@ -27,6 +27,7 @@
 #include "FGPlayerState.h"
 #include "FGResourceSinkSubsystem.h"
 #include "FGRecipe.h"
+#include "GameFramework/GameStateBase.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
 #include "ItemAmount.h"
@@ -1755,7 +1756,34 @@ namespace DDC::Dev
 			return;
 		}
 		bStarted = true;
-		StartAutoTest(World, 20.0f);
+		// -DDCAutoTestPlayers=N: wait until N players are in the game first (a listen host with joined players), at most 10 minutes.
+		int32 WaitForPlayers = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("DDCAutoTestPlayers="), WaitForPlayers);
+		if (WaitForPlayers <= 1)
+		{
+			StartAutoTest(World, 20.0f);
+			return;
+		}
+		UE_LOG(LogDimensionalDismantleCrate, Display, TEXT("[DDCTest] waiting for %d players (at most 10 minutes)"), WaitForPlayers);
+		const TWeakObjectPtr<UWorld> WeakWorld(World);
+		const double GiveUpAt = FPlatformTime::Seconds() + 600.0;
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakWorld, WaitForPlayers, GiveUpAt](float)
+		{
+			UWorld* GameWorld = WeakWorld.Get();
+			if (!GameWorld)
+			{
+				return false;
+			}
+			const AGameStateBase* GameState = GameWorld->GetGameState();
+			const int32 Players = GameState ? GameState->PlayerArray.Num() : 0;
+			if (Players < WaitForPlayers && FPlatformTime::Seconds() < GiveUpAt)
+			{
+				return true;
+			}
+			UE_LOG(LogDimensionalDismantleCrate, Display, TEXT("[DDCTest] %d player(s) in the game; starting"), Players);
+			StartAutoTest(GameWorld, 20.0f);
+			return false;
+		}), 2.0f);
 	}
 }
 

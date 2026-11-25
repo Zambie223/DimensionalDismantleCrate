@@ -91,7 +91,7 @@ Dedicated servers have no menu. Use either of these:
 
 ## Status
 
-Version 0.3.0 has been tested on game 1.2.5.1 with SML 3.12.1, using a late-game save with 16 uploaders. An automated in-game test of 45 checks, run on a development build of the same code, passed in single player, on a Windows dedicated server with a joined player (once with the mod and once without it) and on a Linux dedicated server with a joined player without the mod. The release build was then run in single player, on the Windows server with a joined player who had the mod and on the Linux server with a joined player who didn't, without errors from the mod, and its Mod Options menu was checked. The checks cover:
+Version 0.3.0 has been tested on game 1.2.5.1 with SML 3.12.1, using a late-game save with 16 uploaders. An automated in-game test of 45 checks, run on a development build of the same code, passed in single player, in a game hosted from the game itself with a joined player who had the mod, and on a Windows and a Linux dedicated server with a joined player (on each, once with the mod and once without it). The release build was then run in single player, in a hosted game and on both servers with a joined player who had the mod, and on the Linux server also with one who didn't, without errors from the mod, and its Mod Options menu was checked. The checks cover:
 - upload speed in Per crate, Shared and Per stack slot mode, matching a vanilla uploader (240 items/min at full research); Shared by all uploaders at 16 uploaders' speed; Instant emptying crates within a few frames
 - depot counts matching what left the crates, and items the depot is full of staying in the crate while the rest upload
 - death crates ignored by default, uploaded with the option, and equipment kept back unless that option is on
@@ -104,7 +104,7 @@ Version 0.3.0 has been tested on game 1.2.5.1 with SML 3.12.1, using a late-game
 - chat notices: an item the depot is full of is named once and not repeated within 5 minutes, an item with room isn't reported, equipment a death crate keeps isn't reported, and the "no uploader built" message goes out once. The messages were seen on the screen of a joined player without the mod, on both the Windows and the Linux server.
 - the cost of the inventory hook (see Limits and notes)
 
-Not tested: a player joining someone who hosts from the game itself (the multiplayer tests used dedicated servers), and an internet game across several PCs; all multiplayer tests ran on one PC.
+Not tested: a player without the mod joining someone who hosts from the game itself (only dedicated servers were tested with such a player), and an internet game across several PCs; all multiplayer tests ran on one PC.
 
 ## Building from source
 
@@ -114,7 +114,7 @@ Not tested: a player joining someone who hosts from the game itself (the multipl
 
 `Tools/create_config_asset.py` creates or updates the Mod Options assets (`Content/DDCConfiguration.uasset` and the dropdown labels in `Content/DDCRateModeEnum.uasset`), and `Tools/verify_config_asset.py` checks them. Both run headless in the editor, with instructions at the top of each file. `Tools/make_icon.py` redraws the icon and needs Python with Pillow.
 
-The automated in-game tests are compiled in only when `DDC_DEV_COMMANDS` is set to 1 in `Source/DimensionalDismantleCrate/DimensionalDismantleCrate.Build.cs` (it is 0 for releases). The dismantle steps of the test call a protected game function, so a test build also needs a `Config/AccessTransformers.ini` containing `[AccessTransformers]` and `Friend=(Class="UFGBuildGunStateDismantle", FriendClass="FDDCDevDismantleAccess")`; it is not part of the repository because release builds don't use it. `Tools/run_autotest.ps1` runs them in single player and `Tools/tests/ddc_ds_test.sh` on a dedicated server; both expect a test save with the Dimensional Depot researched and an uploader built, and their paths point at a local test setup that you will need to adjust.
+The automated in-game tests are compiled in only when `DDC_DEV_COMMANDS` is set to 1 in `Source/DimensionalDismantleCrate/DimensionalDismantleCrate.Build.cs` (it is 0 for releases). The dismantle steps of the test call a protected game function, so a test build also needs a `Config/AccessTransformers.ini` containing `[AccessTransformers]` and `Friend=(Class="UFGBuildGunStateDismantle", FriendClass="FDDCDevDismantleAccess")`; it is not part of the repository because release builds don't use it. `Tools/run_autotest.ps1` runs them in single player, `Tools/tests/ddc_listen_test.ps1` in a game hosted from the game itself with a second instance joined, and `Tools/tests/ddc_ds_test.sh` on a dedicated server; all three expect a test save with the Dimensional Depot researched and an uploader built, and their paths point at a local test setup that you will need to adjust.
 
 ## License
 
@@ -124,4 +124,4 @@ Dimensional Dismantle Crate is free software: you can redistribute it and/or mod
 
 ## Responsible AI use disclosure
 
-Most of the code, tooling and documentation in this mod were written by an AI coding assistant (Claude, made by Anthropic, used through Claude Code), working under the maintainer's direction. The maintainer set the requirements and design decisions. Correctness was checked with hands-on runs in a real Satisfactory game client and on Windows and Linux dedicated servers (see Status above), but not every line has been reviewed by a person. AI-written code can contain mistakes: review it before relying on it, and back up your saves.
+Most of the code, tooling, artwork and documentation in this mod, including the changelogs, were written by an AI coding assistant (Claude, made by Anthropic, used through Claude Code), working under the maintainer's direction. The maintainer set the requirements and design decisions. Correctness was checked with hands-on runs in a real Satisfactory game client and on Windows and Linux dedicated servers (see Status above), but not every line has been reviewed by a person. AI-written code can contain mistakes: review it before relying on it, and back up your saves.

@@ -20,6 +20,7 @@ param(
     [string]$GameDir = 'M:\Satismod\GameCopy-1.2.5.1',  # test copy of the game (never the real install)
     [string]$UserDir = 'M:/Satismod/GameCopy1251User',
     [int]$SmokeSeconds = 0,
+    [int]$WaitForPlayers = 0,                   # >1: the auto-test waits until that many players are in (listen host + joined players)
     [string]$BackupRoot = 'M:\Satismod\backups'
 )
 $ErrorActionPreference = 'Stop'
@@ -48,7 +49,7 @@ foreach ($f in $realAutosaves) { Copy-Item $f.FullName $Backup; $hashes[$f.Name]
 # 2. Launch (listen: sessions without it have ignored input; the test itself needs no input) and move the window away.
 $logStart = if (Test-Path $Log) { (Get-Item $Log).LastWriteTime } else { Get-Date 0 }
 $url = "open Persistent_Level?loadgame=${TestSave}?listen"
-$proc = Start-Process $Exe -ArgumentList @("-userdir=$UserDir", '-windowed', '-ResX=1280', '-ResY=720', '-DDCAutoTest', "-ExecCmds=`"$url`"") -PassThru
+$proc = Start-Process $Exe -ArgumentList (@("-userdir=$UserDir", '-windowed', '-ResX=1280', '-ResY=720', '-DDCAutoTest', "-ExecCmds=`"$url`"") + $(if ($WaitForPlayers -gt 1) { @("-DDCAutoTestPlayers=$WaitForPlayers") } else { @() })) -PassThru
 "launched pid $($proc.Id): $url"
 
 Add-Type -Namespace DDC -Name Win -MemberDefinition @'
@@ -63,8 +64,8 @@ $result = 'TIMEOUT'
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 5
     # Every pass: Unreal's splash window is replaced by the game window, so moving the first handle once isn't enough.
-    $game = Get-TestGame | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-    if ($game) {
+    $games = @(Get-TestGame | Where-Object { $_.MainWindowHandle -ne 0 })
+    foreach ($game in $games) {
         [DDC.Win]::SetWindowPos($game.MainWindowHandle, [IntPtr]::Zero, -4000, 0, 0, 0, 0x0001 -bor 0x0004 -bor 0x0010) | Out-Null
         if (-not $moved) { 'window moved off-screen' }
         $moved = $true

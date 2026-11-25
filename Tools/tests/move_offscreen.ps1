@@ -6,6 +6,8 @@ Add-Type -Namespace DDCOff -Name Win -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetWindowPos(System.IntPtr h, System.IntPtr a, int x, int y, int cx, int cy, uint f);
 '@
 $prefix = $GameDir.TrimEnd('\', '/')
-$game = Get-Process FactoryGameSteam-Win64-Shipping -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -like "$prefix*" -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-if ($game) { [DDCOff.Win]::SetWindowPos($game.MainWindowHandle, [IntPtr]::Zero, -4000, 0, 0, 0, 0x0001 -bor 0x0004 -bor 0x0010) | Out-Null; 'moved' } else { 'no window' }
+# Every window: a listen-host test runs two instances (host and client).
+$games = @(Get-Process FactoryGameSteam-Win64-Shipping -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -like "$prefix*" -and $_.MainWindowHandle -ne 0 })
+foreach ($game in $games) { [DDCOff.Win]::SetWindowPos($game.MainWindowHandle, [IntPtr]::Zero, -4000, 0, 0, 0, 0x0001 -bor 0x0004 -bor 0x0010) | Out-Null }
+if ($games) { "moved $($games.Count)" } else { 'no window' }
